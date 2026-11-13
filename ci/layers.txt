@@ -1,0 +1,12 @@
+# Each workspace crate, then the workspace crates it may depend on, in
+# dependencies and dev-dependencies alike. A crate only uses lower layers.
+yoyomi-core:
+yoyomi-formats: yoyomi-core
+yoyomi-render: yoyomi-core
+yoyomi-state: yoyomi-core
+yoyomi-view: yoyomi-core yoyomi-render
+yoyomi-text: yoyomi-core yoyomi-formats
+yoyomi-search: yoyomi-core
+yoyomi-web: yoyomi-core
+yoyomi-native: yoyomi-core yoyomi-render yoyomi-view
+yoyomi: yoyomi-core yoyomi-formats yoyomi-render yoyomi-state yoyomi-view yoyomi-text yoyomi-search yoyomi-web yoyomi-native

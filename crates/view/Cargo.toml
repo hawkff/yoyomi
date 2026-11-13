@@ -1,0 +1,20 @@
+[package]
+name = "yoyomi-view"
+description = "The page pipeline of yoyomi: page turns and the webtoon strip"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+yoyomi-core.workspace = true
+yoyomi-render.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
+
+[lints]
+workspace = true

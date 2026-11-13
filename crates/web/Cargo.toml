@@ -1,0 +1,17 @@
+[package]
+name = "yoyomi-web"
+description = "The browser reader of yoyomi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+yoyomi-core.workspace = true
+parking_lot.workspace = true
+rustix.workspace = true
+
+[lints]
+workspace = true

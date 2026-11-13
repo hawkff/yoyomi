@@ -1,0 +1,26 @@
+[package]
+name = "yoyomi-native"
+description = "The native macOS fullscreen reader of yoyomi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+yoyomi-core.workspace = true
+yoyomi-render.workspace = true
+yoyomi-view.workspace = true
+crossbeam-channel.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+dispatch2.workspace = true
+objc2.workspace = true
+objc2-app-kit.workspace = true
+objc2-core-foundation.workspace = true
+objc2-core-graphics.workspace = true
+objc2-foundation.workspace = true
+
+[lints]
+workspace = true

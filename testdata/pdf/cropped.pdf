@@ -1,0 +1,17 @@
+%PDF-1.4
+1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj
+2 0 obj<</Type/Pages/Kids[3 0 R 6 0 R]/Count 2>>endobj
+3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 100]/CropBox[5 10 200 95]/Resources<</Font<</F1 4 0 R>>>>/Contents 5 0 R/Annots[7 0 R 8 0 R]>>endobj
+4 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj
+5 0 obj<</Length 94>>stream
+BT /F1 12 Tf 10 80 Td (Hello reader) Tj 0 -20 Td (visit example) Tj 0 -20 Td (next page) Tj ET
+endstream
+endobj
+6 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 100]/Resources<</Font<</F1 4 0 R>>>>/Contents 9 0 R>>endobj
+7 0 obj<</Type/Annot/Subtype/Link/Rect[10 56 90 72]/Border[0 0 0]/A<</S/URI/URI(https://example.com/a?utm_source=pdf)>>>>endobj
+8 0 obj<</Type/Annot/Subtype/Link/Rect[10 36 70 52]/Border[0 0 0]/Dest[6 0 R /Fit]>>endobj
+9 0 obj<</Length 36>>stream
+BT /F1 12 Tf 10 80 Td (Second) Tj ET
+endstream
+endobj
+trailer<</Root 1 0 R>>
