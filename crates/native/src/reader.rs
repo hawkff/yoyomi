@@ -318,6 +318,7 @@ impl Reader {
                 transform,
                 selected_page: state.page,
                 text_top: 0,
+                fill: None,
             };
             let update = self.pager.show(request);
             self.apply(update, false);

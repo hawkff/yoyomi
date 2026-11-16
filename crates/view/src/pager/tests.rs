@@ -67,11 +67,13 @@ impl Book for FakeBook {
 }
 
 /// A renderer of one kind that records each page it renders, with its invert
-/// flag. Frames are at most 6 x 8 cells, and kitty uploads are 100 bytes.
+/// flag, and the size of each image. Frames are at most 6 x 8 cells, and
+/// kitty uploads are 100 bytes.
 struct Recording {
     kind: RendererKind,
     cell: Mutex<CellSize>,
     renders: Mutex<Vec<(usize, bool)>>,
+    sizes: Mutex<Vec<(u32, u32)>>,
 }
 
 impl Renderer for Recording {
@@ -89,6 +91,7 @@ impl Renderer for Recording {
 
     fn render(&self, image: &RgbaImage, id: ImageId, max: Grid, invert: bool) -> Result<Frame> {
         self.renders.lock().push((usize::from(image.get_pixel(0, 0)[0]), invert));
+        self.sizes.lock().push(image.dimensions());
         let grid = Grid::new(max.cols.min(6), max.rows.min(8));
         Ok(match self.kind {
             RendererKind::Kitty => Frame::Kitty { id, grid, upload: vec![7; UPLOAD].into() },
@@ -129,7 +132,7 @@ fn rig_with(kind: RendererKind, len: usize, tmux: bool, failing: Option<usize>, 
         decodes: Mutex::new(Vec::new()),
         cancelled: AtomicUsize::new(0),
     });
-    let renderer = Arc::new(Recording { kind, cell: Mutex::new(CellSize::FALLBACK), renders: Mutex::new(Vec::new()) });
+    let renderer = Arc::new(Recording { kind, cell: Mutex::new(CellSize::FALLBACK), renders: Mutex::new(Vec::new()), sizes: Mutex::default() });
     let resident = Arc::new(Resident::new(ImageIds::with_base(0x100), tmux));
     let (sender, events) = crossbeam_channel::unbounded();
     let pager = Pager::new(Arc::new(PageCache::new(book.clone())), renderer.clone(), Jobs::new(2), resident.clone(), sender);
@@ -170,6 +173,13 @@ impl Rig {
         }
     }
 
+    /// Shows `request` and, once it rendered, steps from it by `delta`.
+    fn step(&mut self, request: PageRequest, delta: isize) -> Option<(usize, f64)> {
+        self.pager.show(request.clone());
+        self.settle();
+        self.pager.step(&request, delta)
+    }
+
     /// The job rendering `page`.
     fn running(&self, page: usize) -> &Running {
         self.pager.running.iter().find(|(key, _)| key.page == page).map(|(_, running)| running).expect("a job renders the page")
@@ -182,7 +192,21 @@ fn lease_of(event: &ViewEvent) -> Option<Lease> {
 }
 
 fn request(page: usize, spread: bool) -> PageRequest {
-    PageRequest { page, spread, grid: Grid::new(21, 10), margin: Grid::default(), transform: Transform::default(), selected_page: page, text_top: 0 }
+    PageRequest {
+        page,
+        spread,
+        grid: Grid::new(21, 10),
+        margin: Grid::default(),
+        transform: Transform::default(),
+        selected_page: page,
+        text_top: 0,
+        fill: None,
+    }
+}
+
+/// A request for the part of `page` at `at`, filling the width.
+fn filling(page: usize, at: f64) -> PageRequest {
+    PageRequest { fill: Some(at), ..request(page, false) }
 }
 
 fn upload_bytes(updates: &[Update]) -> usize {
@@ -352,6 +376,121 @@ fn spread_turns_stop_on_the_last_pair() {
     }
     assert_eq!(turn(2, 1, false, 3), 2);
     assert_eq!(turn(0, -1, false, 3), 0);
+}
+
+#[test]
+fn a_filling_page_shows_in_even_parts_that_overlap() {
+    // The 21 x 10 box is 168 x 160 pixels, so a page 21 pixels wide shows 20
+    // rows at a time. Each pixel holds its row.
+    let (max, cell) = (Grid::new(21, 10), CellSize::FALLBACK);
+    let page = RgbaImage::from_fn(21, 50, |_, y| [y as u8, 0, 0, 255].into());
+    assert_eq!(steps(50, part_rows(21, 50, max, cell)), 2);
+    for (at, top) in [(0.0, 0), (0.5, 15), (1.0, 30), (7.0, 30), (-1.0, 0), (f64::NAN, 0)] {
+        let part = fill_part(&page, at, max, cell).expect("the page is taller than the box");
+        assert_eq!((part.dimensions(), part.get_pixel(0, 0)[0]), ((21, 20), top), "at {at}");
+    }
+    // A page as tall as the box shows whole, and so does a shorter one.
+    for height in [20, 7] {
+        assert_eq!(steps(height, part_rows(21, height, max, cell)), 0);
+        assert!(fill_part(&RgbaImage::new(21, height), 0.5, max, cell).is_none(), "{height} rows");
+    }
+    // A cell without a size gives the box no shape.
+    assert_eq!(part_rows(21, 50, max, CellSize { w: 0.0, h: 0.0 }), 50);
+    assert_eq!(steps(0, part_rows(21, 0, max, cell)), 0);
+}
+
+#[test]
+fn steps_walk_the_parts_of_a_page_then_turn_it() {
+    // Every page is 21 x 50 and shows 20 rows at a time, in three parts.
+    let mut rig = rig_with(RendererKind::Sixel, 3, false, None, None, (21, 50));
+    assert_eq!(rig.pager.step(&filling(0, 0.0), 1), None, "a page that has not rendered has no known parts");
+    let cases = [
+        ((0, 0.0), 1, (0, 0.5)),
+        ((0, 0.5), 1, (0, 1.0)),
+        ((0, 1.0), 1, (1, 0.0)),
+        ((0, 1.0), -1, (0, 0.5)),
+        ((0, 0.0), -1, (0, 0.0)),
+        ((0, 0.0), 3, (1, 0.0)),
+        ((0, 0.5), 9, (2, 0.0)),
+        ((1, 0.0), -1, (0, 1.0)),
+        ((2, 0.0), 1, (2, 0.5)),
+        ((2, 1.0), 1, (2, 1.0)),
+        ((2, 1.0), -5, (0, 1.0)),
+        ((0, 0.5), isize::MAX, (2, 0.0)),
+        ((0, 0.5), isize::MIN, (0, 0.0)),
+    ];
+    for ((page, at), delta, want) in cases {
+        assert_eq!(rig.step(filling(page, at), delta), Some(want), "{delta} from page {page} at {at}");
+    }
+    // Turned, the page is 50 wide and 21 tall, and fits.
+    let turned = PageRequest { transform: Transform { quarter_turns: 1, ..Transform::default() }, ..filling(0, 0.0) };
+    assert_eq!(rig.step(turned, 1), Some((1, 0.0)));
+    // A taller box shows 30 rows at a time, in two parts. The place a resize
+    // leaves between them steps to the part in the direction of the turn,
+    // not past it.
+    let resized = PageRequest { grid: Grid::new(21, 15), ..filling(0, 0.5) };
+    assert_eq!(rig.step(resized.clone(), 1), Some((0, 1.0)));
+    assert_eq!(rig.pager.step(&resized, -1), Some((0, 0.0)));
+}
+
+#[test]
+fn a_failed_page_is_one_part_and_a_long_page_keeps_count() {
+    let mut rig = rig_with(RendererKind::Sixel, 3, false, Some(1), None, (21, 50));
+    assert_eq!(rig.step(filling(1, 0.0), 1), Some((2, 0.0)), "a failed page turns at once");
+    assert_eq!(rig.pager.step(&filling(1, 0.0), -1), Some((0, 1.0)));
+
+    // 150 rows show 20 at a time: eight parts, whose places are sevenths.
+    let mut rig = rig_with(RendererKind::Sixel, 2, false, None, None, (21, 150));
+    for (delta, from, to) in [(1, (0, 0.0), (1, 0.0)), (-1, (1, 0.0), (0, 0.0))] {
+        let (mut place, mut presses) = (from, 0);
+        while place != to && presses < 20 {
+            place = rig.step(filling(place.0, place.1), delta).expect("the page rendered");
+            presses += 1;
+        }
+        assert_eq!((place, presses), (to, 8), "seven steps and a turn, by {delta}");
+    }
+}
+
+#[test]
+fn the_next_part_of_a_page_with_a_selection_is_ready_too() {
+    let mut rig = rig_with(RendererKind::Sixel, 3, false, None, None, (21, 50));
+    let highlights: Arc<[PageRect]> = Arc::from([PageRect { x0: 0.5, y0: 0.9, x1: 1.0, y1: 1.0 }]);
+    let lit = |at| PageRequest { transform: Transform { highlights: highlights.clone(), ..Transform::default() }, ..filling(0, at) };
+    rig.pager.show(lit(0.0));
+    rig.settle();
+    assert!(rig.pager.show(lit(0.5)).shown.is_some(), "the middle part is ready with its highlights");
+    rig.settle();
+    rig.pager.show(lit(1.0));
+    rig.settle();
+    // A turn drops the selection, so the next page readies without it.
+    assert!(rig.pager.show(filling(1, 0.0)).shown.is_some());
+}
+
+#[test]
+fn the_next_part_is_ready_before_the_step() {
+    for kind in KINDS {
+        let mut rig = rig_with(kind, 3, false, None, None, (21, 50));
+        assert!(rig.pager.show(filling(0, 0.0)).shown.is_none(), "the top part renders first");
+        assert_eq!(shown(rig.settle()).page, 0);
+        assert_eq!(rig.renderer.sizes.lock().as_slice(), [(21, 20); 2], "the top part, then the middle one in the background");
+
+        let step = rig.pager.show(filling(0, 0.5));
+        assert!(step.shown.is_some() && step.uploads.is_empty(), "{kind:?}: the middle part is ready");
+        rig.settle();
+        assert_eq!((rig.renders(), rig.decodes_of(&[0])), (3, 1), "the bottom part readies; the top one is still there");
+
+        assert!(rig.pager.show(filling(0, 1.0)).shown.is_some(), "{kind:?}: the bottom part is ready");
+        rig.settle();
+        assert_eq!((rig.renders_of(&[0]), rig.renders_of(&[1])), (3, 1), "the top of page 1 readies");
+        let turn = rig.pager.show(filling(1, 0.0));
+        assert_eq!(turn.shown.expect("page 1 is ready").page, 1);
+        rig.settle();
+
+        // A spread shows whole pages.
+        rig.pager.show(PageRequest { fill: Some(0.5), ..request(0, true) });
+        rig.settle();
+        assert_eq!(rig.renderer.sizes.lock().last(), Some(&(21, 50)));
+    }
 }
 
 #[test]
@@ -579,7 +718,12 @@ impl Book for TextFake {
 #[test]
 fn text_pages_show_as_plain_text_under_half_blocks() {
     let book = Arc::new(TextFake { path: PathBuf::from("/books/text.epub"), paragraphs: vec!["one two three four five".into(), "x".repeat(30)] });
-    let renderer = Arc::new(Recording { kind: RendererKind::HalfBlock, cell: Mutex::new(CellSize::FALLBACK), renders: Mutex::new(Vec::new()) });
+    let renderer = Arc::new(Recording {
+        kind: RendererKind::HalfBlock,
+        cell: Mutex::new(CellSize::FALLBACK),
+        renders: Mutex::new(Vec::new()),
+        sizes: Mutex::default(),
+    });
     let (sender, _events) = crossbeam_channel::unbounded();
     let resident = Arc::new(Resident::new(ImageIds::with_base(0x100), false));
     let mut pager = Pager::new(Arc::new(PageCache::new(book)), renderer.clone(), Jobs::new(2), resident, sender);

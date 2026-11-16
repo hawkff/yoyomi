@@ -8,8 +8,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crossbeam_channel::Sender;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+use yoyomi_core::image::imageops;
 use yoyomi_core::{
-    At, Book, Cancel, Frame, Grid, ImageId, Jobs, Layer, PageCache, PageKind, Priority, Renderer, RendererKind, Result, Transform, Upload,
+    At, Book, Cancel, CellSize, Frame, Grid, ImageId, Jobs, Layer, PageCache, PageKind, Priority, Renderer, RendererKind, Result, RgbaImage,
+    Transform, Upload,
 };
 
 use crate::{Lease, Resident, Shown, Update, ViewEvent, next_source};
@@ -46,6 +48,11 @@ pub struct PageRequest {
     pub selected_page: usize,
     /// Rows a plain-text page scrolls down; see `Pager::text_rows`.
     pub text_top: usize,
+    /// Scale the page to the width of its box and show the part of it one
+    /// box tall at this place, from 0 at the top of the page to 1 at its
+    /// bottom; `Pager::step` gives the places. A page that fits the box at
+    /// full width shows whole, and so do the pages of a spread.
+    pub fill: Option<f64>,
 }
 
 /// Shows the pages of one book in one pane.
@@ -90,12 +97,17 @@ struct FrameKey {
     /// The transform, with `invert` off where the book cannot invert the page.
     transform: Transform,
     kind: RendererKind,
+    /// `PageRequest::fill`, bit for bit.
+    fill: Option<u64>,
 }
 
 struct Cached {
     key: FrameKey,
     /// The frame, without kitty upload bytes.
     frame: Frame,
+    /// The size of the page as it rendered: turned and zoomed, before `fill`
+    /// took a part of it.
+    size: (u32, u32),
     lease: Option<Lease>,
     /// Under tmux, the upload, which goes out with every show of the frame.
     upload: Option<Upload>,
@@ -122,7 +134,8 @@ impl Slot {
 struct Rendered {
     job: u64,
     key: FrameKey,
-    result: Result<Frame>,
+    /// The frame and the size of its page; see `Cached::size`.
+    result: Result<(Frame, (u32, u32))>,
     claim: Claim,
 }
 
@@ -206,7 +219,7 @@ impl Pager {
             // Another frame took the id while this one rendered; its upload
             // would replace that frame's image.
             Ok(_) if claim.lease.is_some_and(|lease| !self.resident.holds(lease)) => self.start(key, priority),
-            Ok(frame) => {
+            Ok((frame, size)) => {
                 let lease = claim.lease.take();
                 let upload = Upload::from_frame(&frame);
                 // Under tmux the upload goes out with every show of the frame.
@@ -216,7 +229,7 @@ impl Pager {
                     Frame::Kitty { id, grid, .. } => Frame::Kitty { id, grid, upload: Arc::from([]) },
                     other => other,
                 };
-                self.insert(Cached { key, frame, lease, upload: kept, used: 0 });
+                self.insert(Cached { key, frame, size, lease, upload: kept, used: 0 });
             }
             // A neighbor that fails renders again, and reports, once it shows.
             Err(error) => {
@@ -227,6 +240,43 @@ impl Pager {
         }
         self.advance(&mut update);
         Ok(update)
+    }
+
+    /// Where a turn by `delta` leads from `request`, which fills the width:
+    /// `delta` parts down or up the page, then past its bottom or top one
+    /// page for each part left over, to the top of a later page or the bottom
+    /// of an earlier one. Returns the page and the place in it, for
+    /// `PageRequest::fill`, or `None` until the frame of `request` rendered:
+    /// its page has no known parts before. A page that failed and one that
+    /// shows as plain text count as one part.
+    pub fn step(&self, request: &PageRequest, delta: isize) -> Option<(usize, f64)> {
+        let at = request.fill.unwrap_or(0.0);
+        let key = self.slots(request).swap_remove(0).key;
+        let steps = match self.find(&key) {
+            Some(i) => {
+                let (width, height) = self.frames[i].size;
+                steps(height, part_rows(width, height, key.max, self.renderer.cell_size())) as isize
+            }
+            None if self.failed.contains_key(&key) || self.is_text(key.page) => 0,
+            None => return None,
+        };
+        // A page of one part keeps its place, whichever side the turn came from.
+        let place = |part: isize| if steps == 0 { at } else { part as f64 / steps as f64 };
+        let (page, last) = (request.page as isize, self.book.len().saturating_sub(1) as isize);
+        // A place between two parts, as a resize leaves it, steps to the next
+        // part in the direction of the turn, so no rows of the page go unseen.
+        let from = at * steps as f64;
+        let from = if delta < 0 { (from - 1e-9).ceil() } else { (from + 1e-9).floor() };
+        let part = (from as isize).saturating_add(delta);
+        Some(if part > steps {
+            let next = page.saturating_add(part - steps).min(last);
+            if next == page { (request.page, place(steps)) } else { (next as usize, 0.0) }
+        } else if part < 0 {
+            let previous = (page + part).max(0);
+            if previous == page { (request.page, place(0)) } else { (previous as usize, 1.0) }
+        } else {
+            (request.page, place(part))
+        })
     }
 
     /// Drops every frame the pager keeps and gives their ids back to the
@@ -264,6 +314,7 @@ impl Pager {
                 ..request.transform.clone()
             },
             kind: self.renderer.kind(),
+            fill: request.fill.filter(|_| !request.spread).map(f64::to_bits),
         };
         if !request.spread {
             return vec![Slot { key: key(request.page, fit(cols)), col: 0, cols, rows }];
@@ -399,14 +450,25 @@ impl Pager {
         }
     }
 
-    /// The slots of the next page or spread, then of the previous one.
+    /// The slots of the next page or spread, then of the previous one. A
+    /// request that fills the width has the next and the previous step, once
+    /// its own frame rendered.
     fn neighbors(&self, request: &PageRequest) -> Vec<Vec<Slot>> {
         let mut sets = Vec::new();
         for delta in [1, -1] {
-            let page = turn(request.page, delta, request.spread, self.book.len());
-            if page != request.page {
-                let transform = Transform { highlights: Arc::from([]), ..request.transform.clone() };
-                sets.push(self.slots(&PageRequest { page, transform, ..request.clone() }));
+            let (page, fill) = match request.fill {
+                Some(_) if !request.spread => match self.step(request, delta) {
+                    Some((page, at)) => (page, Some(at)),
+                    None => continue,
+                },
+                fill => (turn(request.page, delta, request.spread, self.book.len()), fill),
+            };
+            if (page, fill) != (request.page, request.fill) {
+                // Another part of the shown page keeps its highlights, as the
+                // step to it will ask for them; a turn drops the selection.
+                let highlights = if page == request.page { request.transform.highlights.clone() } else { Arc::from([]) };
+                let transform = Transform { highlights, ..request.transform.clone() };
+                sets.push(self.slots(&PageRequest { page, fill, transform, ..request.clone() }));
             }
         }
         sets
@@ -452,15 +514,54 @@ impl Drop for Pager {
     }
 }
 
-/// Decodes, transforms and renders one frame. Kitty frames take a lease
-/// into `claim` right before rendering, so cancelled work holds no id.
-fn render(book: &PageCache, renderer: &dyn Renderer, claim: &mut Claim, key: &FrameKey, cancel: &Cancel) -> Result<Frame> {
+/// Decodes, transforms and renders one frame, and returns it with the size
+/// of its page; see `Cached::size`. Kitty frames take a lease into `claim`
+/// right before rendering, so cancelled work holds no id.
+fn render(book: &PageCache, renderer: &dyn Renderer, claim: &mut Claim, key: &FrameKey, cancel: &Cancel) -> Result<(Frame, (u32, u32))> {
     let pixels = book.page(key.page, cancel)?;
-    let (image, invert) = yoyomi_render::apply(&pixels, &key.transform);
+    let (mut image, invert) = yoyomi_render::apply(&pixels, &key.transform);
+    let size = image.dimensions();
+    if let Some(at) = key.fill {
+        let cell = CellSize { w: f64::from_bits(key.cell.0), h: f64::from_bits(key.cell.1) };
+        if let Some(part) = fill_part(&image, f64::from_bits(at), key.max, cell) {
+            image = Arc::new(part);
+        }
+    }
     cancel.check()?;
     let lease = (renderer.kind() == RendererKind::Kitty).then(|| claim.resident.lease());
     claim.lease = lease;
-    renderer.render(&image, lease.map_or(ImageId(0), |lease| lease.id), key.max, invert)
+    Ok((renderer.render(&image, lease.map_or(ImageId(0), |lease| lease.id), key.max, invert)?, size))
+}
+
+/// The rows of a page of `width` x `height` pixels that a box of `max` cells
+/// shows once the page fills the box's width: at most the whole page, and
+/// rounded down, so the part is no taller than the box and its width decides
+/// the fit.
+fn part_rows(width: u32, height: u32, max: Grid, cell: CellSize) -> u32 {
+    let rows = f64::from(width) * f64::from(max.rows) * cell.h / (f64::from(max.cols) * cell.w);
+    // Without a cell size the box has no shape, and the page shows whole.
+    if rows.is_finite() { (rows as u32).clamp(1, height.max(1)) } else { height.max(1) }
+}
+
+/// How many steps lead from the top part of a page `height` pixels tall to
+/// its bottom part, showing `part` rows at a time: none for a page that shows
+/// whole. The parts spread evenly over the page and overlap.
+fn steps(height: u32, part: u32) -> usize {
+    height.div_ceil(part).saturating_sub(1) as usize
+}
+
+/// The part of `image` at `at`, from 0 at its top to 1 at its bottom, that a
+/// box of `max` cells shows at the image's full width, or `None` when the
+/// box shows all of it.
+fn fill_part(image: &RgbaImage, at: f64, max: Grid, cell: CellSize) -> Option<RgbaImage> {
+    let (width, height) = image.dimensions();
+    let part = part_rows(width, height, max, cell);
+    if part >= height {
+        return None;
+    }
+    // A place that is not a number casts to the top.
+    let top = (at.clamp(0.0, 1.0) * f64::from(height - part)).round() as u32;
+    Some(imageops::crop_imm(image, 0, top, width, part).to_image())
 }
 
 /// The page a turn by `delta` from `page` leads to: a spread moves two pages,
