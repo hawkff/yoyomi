@@ -13,6 +13,7 @@ use yoyomi_core::{
     At, Book, Cancel, CellSize, Frame, Grid, ImageId, Jobs, Layer, PageCache, PageKind, Priority, Renderer, RendererKind, Result, RgbaImage,
     Transform, Upload,
 };
+use yoyomi_render::MAX_CELLS;
 
 use crate::{Lease, Resident, Shown, Update, ViewEvent, next_source};
 
@@ -302,7 +303,12 @@ impl Pager {
     /// page shows that page on the left.
     fn slots(&self, request: &PageRequest) -> Vec<Slot> {
         let Grid { cols, rows } = request.grid;
-        let fit = |cols: u16| Grid::new(cols.saturating_sub(request.margin.cols).max(1), rows.saturating_sub(request.margin.rows).max(1));
+        // A kitty frame reaches as far as its placeholders, so a page fits,
+        // and fills, the box they cover.
+        let kitty = self.renderer.kind() == RendererKind::Kitty;
+        let limit = |cells: u16| if kitty { cells.min(MAX_CELLS) } else { cells };
+        let fit =
+            |cols: u16| Grid::new(limit(cols.saturating_sub(request.margin.cols).max(1)), limit(rows.saturating_sub(request.margin.rows).max(1)));
         let cell = self.renderer.cell_size();
         let key = |page: usize, max: Grid| FrameKey {
             page,

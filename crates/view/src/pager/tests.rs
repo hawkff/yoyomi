@@ -434,6 +434,20 @@ fn steps_walk_the_parts_of_a_page_then_turn_it() {
 }
 
 #[test]
+fn kitty_parts_fill_the_box_its_placeholders_reach() {
+    // A pane of 400 columns: kitty frames stop at 297, where a page 297
+    // pixels wide shows 20 rows in 10 rows of cells; sixel uses all 400
+    // columns and shows 14.
+    let wide = PageRequest { grid: Grid::new(400, 10), ..filling(0, 0.0) };
+    for (kind, rows) in [(RendererKind::Kitty, 20), (RendererKind::Sixel, 14)] {
+        let mut rig = rig_with(kind, 2, false, None, None, (297, 600));
+        rig.pager.show(wide.clone());
+        rig.settle();
+        assert_eq!(rig.renderer.sizes.lock()[0], (297, rows), "{kind:?}");
+    }
+}
+
+#[test]
 fn a_failed_page_is_one_part_and_a_long_page_keeps_count() {
     let mut rig = rig_with(RendererKind::Sixel, 3, false, Some(1), None, (21, 50));
     assert_eq!(rig.step(filling(1, 0.0), 1), Some((2, 0.0)), "a failed page turns at once");
