@@ -113,6 +113,9 @@ struct Pane {
     /// The zoom and center the shown frame was rendered with; keys change
     /// `zoom` and `center` before their frame arrives.
     shown_crop: (f64, (f64, f64)),
+    /// Whether the shown frame holds a part of its page, as theater mode
+    /// renders it; `T` changes the mode before its frame arrives.
+    shown_part: bool,
     /// Under tmux, the uploads of the images `shown` draws, which a frame
     /// sends whenever it draws them anew.
     uploads: Vec<Upload>,
@@ -137,6 +140,7 @@ impl Default for Pane {
             part: 0.0,
             shown: None,
             shown_crop: (1.0, (0.5, 0.5)),
+            shown_part: false,
             uploads: Vec::new(),
             loading: false,
             chapters: None,
@@ -695,7 +699,7 @@ impl App {
             self.uploads.extend(uploads);
         }
         self.sixel_fresh = self.sixel_fresh || shown.scene.layers.iter().any(|layer| matches!(layer, Layer::Sixel { .. }));
-        let spread = self.spread && !self.split;
+        let (spread, theater) = (self.spread && !self.split, self.theater);
         let pane = &mut self.panes[i];
         if let Some(reader) = &mut pane.reader {
             if pane.shown.as_ref().is_some_and(|old| old.page != shown.page) {
@@ -703,8 +707,9 @@ impl App {
             }
             reader.select.on_frame(&[shown.page, shown.page + usize::from(spread)]);
         }
-        // The views send frames of their latest request only, which the current zoom and center made.
+        // The views send frames of their latest request only, which the current zoom, center and mode made.
         pane.shown_crop = (pane.zoom, pane.center);
+        pane.shown_part = theater;
         pane.page = shown.page;
         pane.loading = false;
         pane.error = None;
@@ -1102,15 +1107,15 @@ impl App {
         self.select_outcome(i, outcome);
     }
 
-    /// The pages of pane `i` under the mouse. Webtoon mode, theater mode and
-    /// turned pages have none, and half blocks show text pages as text, which
-    /// the terminal selects.
+    /// The pages of pane `i` under the mouse. Webtoon mode, a part of a page
+    /// in theater mode and turned pages have none, and half blocks show text
+    /// pages as text, which the terminal selects.
     fn select_view(&self, i: usize) -> select::View {
         let pane = &self.panes[i];
         let mut slots = Vec::new();
         if let (Some(reader), Some(shown)) = (&pane.reader, &pane.shown)
             && !self.webtoon
-            && !self.theater
+            && !pane.shown_part
             && pane.quarter_turns == 0
         {
             let text_images = self.renderer.kind() != RendererKind::HalfBlock;
@@ -1994,8 +1999,11 @@ pub(crate) mod tests {
         keys(&mut app, "+");
         assert!(app.status_left().ends_with("theater mode fits pages to the pane width") && app.panes[0].zoom == 1.0);
 
-        assert_eq!(press(&mut app, "T"), (0, 0.0), "leaving theater mode shows the page whole");
+        keys(&mut app, "T");
         assert_eq!((app.theater, app.page_request(0).fill), (false, None));
+        assert!(app.select_view(0).slots.is_empty(), "nor does the part still on screen while the page renders");
+        run_views(&mut app, &views, |app| !app.panes[0].loading);
+        assert_eq!(place(&app), (0, 0.0), "leaving theater mode shows the page whole");
         assert!(!app.select_view(0).slots.is_empty(), "a whole page does");
         assert_eq!(press(&mut app, "j"), (1, 0.0), "pages turn again");
         keys(&mut app, "Tt");
