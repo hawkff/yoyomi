@@ -339,6 +339,7 @@ default openers in the "open with" menu, write `use = ["yy", "open"]`.
 | `g` / `G` | first / last page (`42G` goes to page 42) |
 | `z` | focus mode: hide the titles and the status bar |
 | `t` | webtoon mode: one continuous strip with eased scrolling (single pane); wide pages shrink to fit, narrow pages keep their size |
+| `T` | theater mode: each page fills the pane's width and shows one part at a time; `j` / `k` step through the parts, then turn the page |
 | `s` | two-page spread (single pane) |
 | `w` | switch pane |
 | `v` | split or unsplit, keeping the active pane |
@@ -400,6 +401,19 @@ key (`Ctrl+Shift+F11` in kitty, `Alt+Enter` in WezTerm, `Ctrl+Shift+F` in
 Konsole) or the window manager's, then press `z` to hide the titles and the
 status bar. In the browser reader, `F11` does the same.
 
+On a wide screen a portrait page takes a narrow column. `T` turns on theater
+mode, where every page grows to the width of its pane and keeps its
+proportions. A page taller than the pane then shows in parts, one screen
+each. yoyomi spreads the parts evenly from the top of the page to its bottom
+and lets them overlap, so a page 2.3 screens tall takes three parts. `j`,
+`J` and the mouse wheel show the next part and turn the page after the last
+one. `k` and `K` go back, and from the top of a page they show the bottom of
+the one before. yoyomi renders the next part ahead of the key, as it does the
+next page, and a step draws one frame without scrolling. `g`, `G` and `0`
+show a page from its top. Theater mode works in a split. In theater mode
+`+`, `-`, `s`, text selection and links are off, and `Q` saves the page but
+not the mode.
+
 ## Mouse
 
 On book and PDF pages, drag to select text. yoyomi highlights the selection
@@ -418,10 +432,10 @@ and `si`. In a split, a click makes the pane under it active.
 Book pages carry their text from the layout. A PDF page reads its text with
 `pdftotext` and `pdftohtml` the first time the mouse moves over it, so a
 scanned PDF without a text layer has nothing to select. Selection needs an
-unrotated page outside webtoon mode. DJVU text serves search only, without
-word positions, so DJVU pages have nothing to select. Terminals without
-pixel graphics show book text as plain text; hold shift there to use the
-terminal's own selection.
+unrotated page outside webtoon and theater modes. DJVU text serves search
+only, without word positions, so DJVU pages have nothing to select.
+Terminals without pixel graphics show book text as plain text; hold shift
+there to use the terminal's own selection.
 
 ## macOS window
 
