@@ -404,6 +404,10 @@ fn steps_walk_the_parts_of_a_page_then_turn_it() {
     // Every page is 21 x 50 and shows 20 rows at a time, in three parts.
     let mut rig = rig_with(RendererKind::Sixel, 3, false, None, None, (21, 50));
     assert_eq!(rig.pager.step(&filling(0, 0.0), 1), None, "a page that has not rendered has no known parts");
+    rig.pager.show(filling(0, 0.0));
+    rig.settle();
+    assert_eq!(rig.pager.step(&filling(0, 1.0), 1), Some((1, 0.0)), "one rendered part tells the size of its page");
+    assert_eq!(rig.pager.step(&filling(1, 0.0), 1), None);
     let cases = [
         ((0, 0.0), 1, (0, 0.5)),
         ((0, 0.5), 1, (0, 1.0)),

@@ -247,15 +247,18 @@ impl Pager {
     /// `delta` parts down or up the page, then past its bottom or top one
     /// page for each part left over, to the top of a later page or the bottom
     /// of an earlier one. Returns the page and the place in it, for
-    /// `PageRequest::fill`, or `None` until the frame of `request` rendered:
-    /// its page has no known parts before. A page that failed and one that
-    /// shows as plain text count as one part.
+    /// `PageRequest::fill`, or `None` until a part of the page rendered: the
+    /// page has no known parts before. A page that failed and one that shows
+    /// as plain text count as one part.
     pub fn step(&self, request: &PageRequest, delta: isize) -> Option<(usize, f64)> {
         let at = request.fill.unwrap_or(0.0);
         let key = self.slots(request).swap_remove(0).key;
-        let steps = match self.find(&key) {
-            Some(i) => {
-                let (width, height) = self.frames[i].size;
+        // Every part of a page renders from the same turned page, so any of
+        // them tells its size.
+        let whole = |key: &FrameKey| FrameKey { fill: None, ..key.clone() };
+        let steps = match self.frames.iter().find(|cached| whole(&cached.key) == whole(&key)) {
+            Some(cached) => {
+                let (width, height) = cached.size;
                 steps(height, part_rows(width, height, key.max, self.renderer.cell_size())) as isize
             }
             None if self.failed.contains_key(&key) || self.is_text(key.page) => 0,
