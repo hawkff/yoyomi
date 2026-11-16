@@ -29,6 +29,7 @@ Book text: images with kitty or sixel graphics, plain text elsewhere (webtoon ne
   f              open active book in native macOS fullscreen (f returns)
   z              toggle terminal focus mode (hide titles and status bar)
   t              toggle continuous webtoon mode (single pane)
+  T              toggle theater mode: pages fill the width, j / k step through each page
   w              switch pane
   v              toggle split          (keeps the active pane)
   s              toggle two-page spread (single pane)
@@ -527,7 +528,7 @@ pub(crate) mod tests {
         keys(&mut app, "?");
         let (buf, _) = render(&app);
         let rows: Vec<String> = (0..40).map(|y| row(&buf, y).trim().to_owned()).collect();
-        assert_eq!(rows[4], "yy: terminal reader (.cbz/.cbr/.epub/.fb2/.docx/.doc/.pdf/.djvu)", "{rows:#?}");
+        assert_eq!(rows[3], "yy: terminal reader (.cbz/.cbr/.epub/.fb2/.docx/.doc/.pdf/.djvu)", "{rows:#?}");
         assert!(rows[35].starts_with("Q              save reading positions"), "{rows:#?}");
         assert!(!rows.iter().any(|row| row.starts_with("page ")));
 
