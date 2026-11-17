@@ -123,6 +123,11 @@ impl Resident {
         self.state.lock().leases.get(&lease.id) == Some(&lease.generation)
     }
 
+    /// Whether a lease holds `id`.
+    pub fn leased(&self, id: ImageId) -> bool {
+        self.state.lock().leases.contains_key(&id)
+    }
+
     /// Marks the image of `lease` as shown now, so it goes last.
     pub fn touch(&self, lease: Lease) {
         let mut state = self.state.lock();

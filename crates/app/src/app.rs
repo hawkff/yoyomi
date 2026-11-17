@@ -2505,9 +2505,10 @@ pub(crate) mod tests {
 
     /// The frames a sliding kitty reader writes, each checked against the
     /// screen before it: no upload to and no delete of an image on screen
-    /// reaches the terminal before the frame that replaces it, and an image
-    /// that left the screen is deleted at most once after it, or replaced by
-    /// the upload of a new image under its id.
+    /// reaches the terminal before the frame that replaces it, an image that
+    /// left the screen is deleted at most once after it, or replaced by the
+    /// upload of a new image under its id, and after each frame the terminal
+    /// keeps only images that the frame draws or a lease holds.
     struct Screen {
         terminal: ratatui::Terminal<CrosstermBackend<Recorder>>,
         written: Recorder,
@@ -2556,6 +2557,9 @@ pub(crate) mod tests {
                     }
                 }
             }
+            let idle = |id: &&u32| !drawn.contains(id) && !app.resident.leased(yoyomi_core::ImageId(**id));
+            let idle: Vec<&u32> = self.images.keys().filter(idle).collect();
+            assert!(idle.is_empty(), "the terminal keeps images nobody holds or shows: {idle:?}");
             self.shown = drawn;
         }
 
@@ -2576,7 +2580,23 @@ pub(crate) mod tests {
                 select! {
                     recv(views) -> event => app.on_view_event(event.unwrap()),
                     recv(timer) -> _ => app.on_timer(Instant::now()),
-                    recv(at(limit)) -> _ => panic!("the views did not settle"),
+                    recv(at(limit)) -> _ => panic!("the views did not settle: left {:?}, kept {:?}", self.left, self.images),
+                }
+                self.frame(app);
+            }
+        }
+
+        /// Runs the loop until `holding` hears that a gate holds its image
+        /// back.
+        fn hold(&mut self, app: &mut App, views: &Receiver<ViewEvent>, holding: &Receiver<()>) {
+            let limit = Instant::now() + Duration::from_secs(20);
+            loop {
+                let timer = app.deadline().map_or_else(never, at);
+                select! {
+                    recv(holding) -> held => return held.expect("the gate stays"),
+                    recv(views) -> event => app.on_view_event(event.unwrap()),
+                    recv(timer) -> _ => app.on_timer(Instant::now()),
+                    recv(at(limit)) -> _ => panic!("no image came to the gate"),
                 }
                 self.frame(app);
             }
@@ -2598,11 +2618,12 @@ pub(crate) mod tests {
             !self.shown.contains(&id) && self.left.get(&id).is_none_or(|&deletes| deletes == 1)
         }
 
-        /// Checks that every image that left the screen left the terminal,
-        /// and that the terminal keeps no image of the mode the reader left.
-        fn check(&self, app: &App) {
-            assert!(self.left.values().all(|&deletes| deletes == 1), "every image that left is deleted: {:?}", self.left);
-            assert_eq!(self.kept(!app.webtoon), 0, "the images of the other mode leave: {:?}", self.images);
+        /// Runs the loop until every image that left the screen left the
+        /// terminal and the terminal keeps no image of the mode the reader
+        /// left. Renders still under way may hold such an image until their
+        /// upload replaces it.
+        fn finish(&mut self, app: &mut App, views: &Receiver<ViewEvent>) {
+            self.run(app, views, |app, screen| screen.left.values().all(|&deletes| deletes == 1) && screen.kept(!app.webtoon) == 0);
         }
     }
 
@@ -2628,8 +2649,8 @@ pub(crate) mod tests {
         assert_eq!(screen.shown, page, "page 2 shows until the strip does");
         drop(open);
         screen.settle(&mut app, &views);
+        screen.finish(&mut app, &views);
         assert!(page.iter().all(|&id| screen.gone(id)), "{:?}", screen.left);
-        screen.check(&app);
     }
 
     #[test]
@@ -2641,15 +2662,15 @@ pub(crate) mod tests {
         // Page 3 shows at once, page 4 renders ahead and waits.
         let (open, holding) = renderer.gate(4);
         screen.press(&mut app, "j");
-        holding.recv_timeout(Duration::from_secs(20)).expect("page 4 renders");
+        screen.hold(&mut app, &views, &holding);
         screen.press(&mut app, "j");
         assert!(app.panes[0].loading && app.shown(0).is_some_and(|shown| shown.page == 2));
         let page = on_screen(&app, 0);
         screen.press(&mut app, "t");
         screen.settle(&mut app, &views);
+        screen.finish(&mut app, &views);
         assert!(app.webtoon && page.iter().all(|&id| screen.gone(id)), "{:?}", screen.left);
         drop(open);
-        screen.check(&app);
     }
 
     #[test]
@@ -2659,14 +2680,17 @@ pub(crate) mod tests {
         screen.frame(&mut app);
         screen.run(&mut app, &views, |_, screen| screen.kept(false) == 3);
         let page = on_screen(&app, 0);
-        let (open, _) = renderer.gate(2);
+        let (open, holding) = renderer.gate(2);
         screen.press(&mut app, "t");
         screen.run(&mut app, &views, |_, screen| screen.kept(true) == 2);
+        // The band in view is the one held back, so `r` comes before the
+        // strip's first frame.
+        screen.hold(&mut app, &views, &holding);
         screen.press(&mut app, "r");
         screen.settle(&mut app, &views);
+        screen.finish(&mut app, &views);
         assert!(page.iter().all(|&id| screen.gone(id)), "{:?}", screen.left);
         drop(open);
-        screen.check(&app);
     }
 
     #[test]
@@ -2675,17 +2699,18 @@ pub(crate) mod tests {
         let mut screen = Screen::new();
         screen.frame(&mut app);
         screen.settle(&mut app, &views);
-        // The glide reaches page 3 and waits for its band.
-        let (open, _) = renderer.gate(3);
+        // The glide reaches page 3, whose band is held back, and waits.
+        let (open, holding) = renderer.gate(3);
         screen.press(&mut app, "2j");
+        screen.hold(&mut app, &views, &holding);
         screen.run(&mut app, &views, |app, _| app.panes[0].loading);
         let slices = on_screen(&app, 0);
         assert!(!slices.is_empty());
         screen.press(&mut app, "G");
         screen.settle(&mut app, &views);
+        screen.finish(&mut app, &views);
         assert!(slices.iter().all(|&id| screen.gone(id)), "{:?}", screen.left);
         drop(open);
-        screen.check(&app);
     }
 
     #[test]
@@ -2699,8 +2724,8 @@ pub(crate) mod tests {
         let band = on_screen(&app, 0);
         screen.press(&mut app, "3j");
         screen.settle(&mut app, &views);
+        screen.finish(&mut app, &views);
         assert!(band.iter().all(|&id| screen.gone(id)), "{:?}", screen.left);
-        screen.check(&app);
     }
 
     #[test]
@@ -2713,9 +2738,9 @@ pub(crate) mod tests {
         screen.press(&mut app, "t");
         assert!(!app.webtoon && screen.shown == bands, "the strip shows until the page does");
         screen.settle(&mut app, &views);
+        // No band stays leased: every band the strip kept leaves the terminal.
+        screen.finish(&mut app, &views);
         assert!(bands.iter().all(|&id| screen.gone(id)), "{:?}", screen.left);
-        // No band stays leased: every band the strip kept left the terminal.
-        screen.check(&app);
     }
 
     #[test]
@@ -2733,8 +2758,8 @@ pub(crate) mod tests {
         assert!(left.iter().all(|id| !screen.left.contains_key(id)));
         drop(open);
         screen.settle(&mut app, &views);
+        screen.finish(&mut app, &views);
         assert!(left.iter().chain(&right).all(|&id| screen.gone(id)), "{:?}", screen.left);
-        screen.check(&app);
     }
 
     #[test]
