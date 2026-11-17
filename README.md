@@ -340,6 +340,7 @@ default openers in the "open with" menu, write `use = ["yy", "open"]`.
 | `z` | focus mode: hide the titles and the status bar |
 | `t` | webtoon mode: one continuous strip (single pane); wide pages shrink to fit, narrow pages keep their size |
 | `T` | theater mode: webtoon mode with every page as wide as the pane (single pane) |
+| `[` / `]` | in theater mode, narrower / wider pages (`3[` for three steps) |
 | `s` | two-page spread (single pane) |
 | `w` | switch pane |
 | `v` | split or unsplit, keeping the active pane |
@@ -408,6 +409,13 @@ screen. `t` switches to webtoon mode in the same place, with each page at
 its own width, and `T` switches back. `Q` saves the mode with the position,
 and `f` takes it to the macOS window.
 
+At the full width a wide pane shows about a third of a portrait page. `[`
+and `]` make theater pages narrower or wider in steps of 5% of the pane,
+from 30% to the whole pane. A narrower page sits in the middle and shows
+more of itself per screen, and the strip stays at the same place. The
+status bar shows a width under 100%. When yoyomi quits, it saves the width
+in `settings.json` with the glide time.
+
 With kitty graphics outside tmux, GNU screen, zellij and herdr, a move in
 webtoon or theater mode glides. The strip slides by pixels and slows to a
 stop. `+` and `-` change the glide time in steps of 40 ms, from 0, which
@@ -442,12 +450,13 @@ there to use the terminal's own selection.
 ## macOS window
 
 `f` opens the active pane's book in a fullscreen window and hands over the
-page, the webtoon or theater position, the glide time, rotation, zoom,
-spread and inversion. `f` in the window brings them back to the terminal.
+page, the webtoon or theater position, the glide time, the theater width,
+rotation, zoom, spread and inversion. `f` in the window brings them back to
+the terminal.
 The window draws at the screen's full resolution and, like the terminal,
 turns to pages rendered ahead. Its keys follow the terminal's: counts,
-`j`/`k`/`J`/`K`, `g`/`G` (`42G` goes to page 42), `s`, `t`, `T`, `R`, `i`,
-`+`/`-`/`0` and the arrows to pan. The mouse wheel and the trackpad turn
+`j`/`k`/`J`/`K`, `g`/`G` (`42G` goes to page 42), `s`, `t`, `T`, `[`/`]`,
+`R`, `i`, `+`/`-`/`0` and the arrows to pan. The mouse wheel and the trackpad turn
 pages, and a click follows a link. In webtoon and theater mode, keys and
 the wheel glide, and the strip follows the fingers on the trackpad. `Q`
 saves the positions of the open books and quits. `q` or closing the window
