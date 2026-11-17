@@ -1,9 +1,10 @@
-//! Reading positions and bookmarks, kept as JSON files in the user config
-//! directory. Every update holds a lock file across reading, merging and
+//! Reading positions, bookmarks and settings, kept as JSON files in the user
+//! config directory. Every update holds a lock file across reading, merging and
 //! renaming, so two readers never lose each other's changes.
 
 mod bookmarks;
 mod positions;
+mod settings;
 mod storage;
 mod time;
 
@@ -12,6 +13,7 @@ use std::path::PathBuf;
 
 pub use bookmarks::{Bookmarks, Mark};
 pub use positions::{Position, Positions};
+pub use settings::Settings;
 pub use storage::BookKey;
 
 /// The directory yoyomi keeps its files in: `$XDG_CONFIG_HOME/yoyomi`, by
