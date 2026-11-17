@@ -472,7 +472,7 @@ impl App {
         {
             self.last_tick = now;
             let before = reader.strip.position();
-            let update = reader.strip.tick();
+            let update = reader.strip.tick(now);
             // A tick that moved nothing, as at an end of the strip, leaves
             // the pane as it was.
             if update.shown.is_some() || reader.strip.position() != before {

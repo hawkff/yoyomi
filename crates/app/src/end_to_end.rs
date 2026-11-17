@@ -194,7 +194,8 @@ fn webtoon_scrolling_uploads_only_new_bands() {
     // A viewport further brings the third band into view: exactly its upload.
     session.press("J");
     session.settle_scroll();
-    let frames = session.press("j") + &session.settle_scroll();
+    // The scroll lands at once and waits there for the band.
+    let frames = session.press("j") + &session.until(|session| session.uploaded.len() == 5 && session.app.deadline().is_none());
     assert_eq!(uploads(&frames), 1, "{frames:?}");
     assert_eq!(session.uploaded.len(), 5);
     assert!(session.on_screen().contains(&session.uploaded[4]));

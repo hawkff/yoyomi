@@ -82,15 +82,17 @@ impl Rig {
         keys.iter().map(|key| self.reader.key(key)).last().flatten()
     }
 
-    /// Eases webtoon scrolling to its end, drawing every frame it moves.
+    /// Runs webtoon scrolling to its end, a tick every 10 ms of a made-up
+    /// clock, drawing every frame it moves.
     fn ease(&mut self) {
+        let start = Instant::now();
         for frames in 0.. {
-            assert!(frames < 1000, "the easing stops");
+            assert!(frames < 1000, "the scrolling stops");
             if !self.reader.moving() {
                 return;
             }
             let before = self.reader.state();
-            self.reader.tick();
+            self.reader.tick_at(start + Duration::from_millis(10) * frames);
             if self.reader.state() != before {
                 self.frame();
             }
