@@ -1207,8 +1207,9 @@ impl App {
         let reader = pane.reader.as_ref()?;
         let at = if self.webtoon { reader.strip.position() } else { StripPosition { page: pane.page, offset: 0.0 } };
         let (quarter_turns, zoom, center, invert) = (pane.quarter_turns, pane.zoom, pane.center, pane.invert);
-        let (webtoon, theater, spread) = (self.webtoon, self.theater, self.spread && !self.split);
-        let state = yoyomi_native::State { page: at.page, offset: at.offset, webtoon, theater, quarter_turns, zoom, center, spread, invert };
+        let (webtoon, theater, spread, glide_ms) = (self.webtoon, self.theater, self.spread && !self.split, self.settings.glide_ms);
+        let state =
+            yoyomi_native::State { page: at.page, offset: at.offset, webtoon, theater, quarter_turns, zoom, center, spread, invert, glide_ms };
         Some((reader.book.clone(), state))
     }
 
@@ -1221,7 +1222,8 @@ impl App {
     }
 
     /// Acts on how the native window closed. A window that failed to open
-    /// leaves the panes as `f` found them.
+    /// leaves the panes as `f` found them; one that closed leaves its glide
+    /// time to the strips and the saved settings.
     fn native_done(&mut self, before: yoyomi_native::State, outcome: yoyomi_core::Result<yoyomi_native::Outcome>) -> Option<String> {
         let outcome = match outcome {
             Ok(outcome) => outcome,
@@ -1231,6 +1233,11 @@ impl App {
             }
         };
         let state = outcome.state;
+        self.settings.glide_ms = state.glide_ms.min(Settings::MAX_GLIDE_MS);
+        let glide = self.glide();
+        for reader in self.panes.iter_mut().filter_map(|pane| pane.reader.as_mut()) {
+            reader.strip.set_glide(glide);
+        }
         match outcome.action {
             yoyomi_native::Action::Return => self.native_return(state),
             yoyomi_native::Action::Save => {
@@ -2006,6 +2013,31 @@ pub(crate) mod tests {
             let outcome = yoyomi_native::Outcome { state, action: yoyomi_native::Action::Save, error: None };
             app.native_done(yoyomi_native::State::default(), Ok(outcome));
             assert_eq!(app.native_save.take().map(|position| (position.webtoon, position.theater)), Some((webtoon, saved)));
+        }
+    }
+
+    #[test]
+    fn the_glide_goes_to_the_native_window_and_comes_back_into_the_settings() {
+        let (mut app, views) = sliding_reader();
+        app.settings.glide_ms = 120;
+        let (_, state) = app.native_state().expect("an open book");
+        assert_eq!(state.glide_ms, 120);
+
+        let state = yoyomi_native::State { webtoon: true, glide_ms: 0, ..yoyomi_native::State::default() };
+        let outcome = yoyomi_native::Outcome { state, action: yoyomi_native::Action::Return, error: None };
+        app.native_done(yoyomi_native::State::default(), Ok(outcome));
+        assert_eq!(app.settings.glide_ms, 0);
+        run_views(&mut app, &views, |app| app.shown(0).is_some() && app.deadline().is_none());
+        let strip = &mut app.panes[0].reader.as_mut().expect("an open book").strip;
+        strip.scroll(1.0);
+        strip.tick(Instant::now());
+        assert_eq!(strip.pending(), 0.0, "the returned glide of 0 moves in one tick");
+
+        // Closing with q or Q keeps it for the settings, at most the longest.
+        for (action, glide_ms, kept) in [(yoyomi_native::Action::Clear, 440, 440), (yoyomi_native::Action::Save, 900, Settings::MAX_GLIDE_MS)] {
+            let state = yoyomi_native::State { glide_ms, ..yoyomi_native::State::default() };
+            app.native_done(yoyomi_native::State::default(), Ok(yoyomi_native::Outcome { state, action, error: None }));
+            assert_eq!(app.settings.glide_ms, kept, "{action:?}");
         }
     }
 

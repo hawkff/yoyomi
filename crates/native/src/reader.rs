@@ -22,6 +22,10 @@ const TURN_POINTS: f64 = 12.0;
 const GESTURE_PAUSE: Duration = Duration::from_millis(150);
 /// Points a mouse wheel notch scrolls in webtoon mode.
 const NOTCH_POINTS: f64 = 12.0;
+/// Milliseconds `+` and `-` add to or take from the glide.
+const GLIDE_STEP_MS: i16 = 40;
+/// The longest glide, in milliseconds.
+const MAX_GLIDE_MS: u16 = 600;
 
 /// One book in the window, shown through a pager and a strip of pixels.
 pub(crate) struct Reader {
@@ -85,10 +89,11 @@ impl Reader {
         // Pixel frames lease no kitty ids.
         let resident = Arc::new(Resident::new(ImageIds::with_base(0), false));
         let pager = Pager::new(book.clone(), renderer.clone(), jobs.clone(), resident.clone(), events.clone());
-        let strip = Strip::new(book.clone(), renderer, jobs, resident, events);
+        let mut strip = Strip::new(book.clone(), renderer, jobs, resident, events);
         // The strip keeps the offset within the page itself.
         let (page, zoom) = (state.page.min(book.len().saturating_sub(1)), state.zoom.clamp(1.0, ZOOM_MAX));
-        let state = State { page, zoom, quarter_turns: state.quarter_turns & 3, ..state };
+        let state = State { page, zoom, quarter_turns: state.quarter_turns & 3, glide_ms: state.glide_ms.min(MAX_GLIDE_MS), ..state };
+        strip.set_glide(Duration::from_millis(state.glide_ms.into()));
         Reader {
             book,
             pager,
@@ -182,8 +187,13 @@ impl Reader {
                 self.reset_view();
             }
             "i" => state.invert = !state.invert,
-            "+" | "=" if !webtoon => state.zoom = (state.zoom * ZOOM_STEP).min(ZOOM_MAX),
-            "-" if !webtoon => {
+            // Showing the strip again would drop the scrolling under way.
+            "+" | "=" | "-" if webtoon => {
+                self.glide_by(if key == "-" { -GLIDE_STEP_MS } else { GLIDE_STEP_MS });
+                return None;
+            }
+            "+" | "=" => state.zoom = (state.zoom * ZOOM_STEP).min(ZOOM_MAX),
+            "-" => {
                 state.zoom = (state.zoom / ZOOM_STEP).max(1.0);
                 if state.zoom <= 1.001 {
                     self.reset_view();
@@ -194,15 +204,23 @@ impl Reader {
             "down" if zoomed && !webtoon => self.pan(0.0, 1.0),
             "left" if zoomed && !webtoon => self.pan(-1.0, 0.0),
             "right" if zoomed && !webtoon => self.pan(1.0, 0.0),
-            "t" => {
-                // Page mode goes on from the page at the top of the strip.
-                self.state.page = self.at().page;
-                self.state.webtoon = !webtoon;
-                self.state.theater = false;
+            // From pages, the strip at the page in view, filling the width
+            // with `T`; from the strip at the other width, this width at the
+            // same place; from the strip at this width, pages at the page on
+            // top.
+            "t" | "T" => {
+                let theater = key == "T";
+                let at = self.at();
+                let switch = webtoon && self.state.theater != theater;
+                if !switch {
+                    self.state.webtoon = !webtoon;
+                    self.strip.clear();
+                }
+                self.state.theater = theater && self.state.webtoon;
+                self.state.page = at.page;
+                self.state.offset = if switch { at.offset } else { 0.0 };
                 self.state.spread = false;
-                self.state.offset = 0.0;
                 self.reset_view();
-                self.strip.clear();
                 self.strip_shown = false;
             }
             "R" => state.quarter_turns = (state.quarter_turns + 1) & 3,
@@ -237,8 +255,12 @@ impl Reader {
     /// it; page mode turns a page per wheel notch or per trackpad gesture.
     pub fn wheel(&mut self, wheel: Wheel, now: Instant) {
         if self.state.webtoon {
-            let points = if wheel.precise { wheel.dy } else { wheel.dy * NOTCH_POINTS };
-            self.strip.scroll(-points * wheel.scale);
+            // A trackpad moves the view with the fingers; a notch glides.
+            if wheel.precise {
+                self.strip.shift(-wheel.dy * wheel.scale);
+            } else {
+                self.strip.scroll(-wheel.dy * NOTCH_POINTS * wheel.scale);
+            }
             return;
         }
         if !wheel.precise || !wheel.gesture {
@@ -366,6 +388,13 @@ impl Reader {
         self.state.page = (page + delta * step).clamp(0, last) as usize;
         self.state.offset = 0.0;
         self.show();
+    }
+
+    /// `+` and `-` in webtoon mode: a glide `step` milliseconds longer,
+    /// within 0 and `MAX_GLIDE_MS`.
+    fn glide_by(&mut self, step: i16) {
+        self.state.glide_ms = self.state.glide_ms.saturating_add_signed(step).min(MAX_GLIDE_MS);
+        self.strip.set_glide(Duration::from_millis(self.state.glide_ms.into()));
     }
 
     fn reset_view(&mut self) {

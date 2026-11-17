@@ -216,15 +216,37 @@ fn webtoon_toggles_keep_the_page_and_reset_the_view() {
 }
 
 #[test]
-fn t_leaves_theater_mode_for_pages_and_then_shows_plain_webtoon() {
-    let state = State { webtoon: true, theater: true, ..State::default() };
+fn t_and_big_t_switch_between_pages_webtoon_and_theater_mode_at_the_same_place() {
+    let state = State { page: 1, spread: true, zoom: 2.0, ..State::default() };
     let mut rig = rig(book(pages(3, 50, 100), None), state, (100, 80));
+    // A theater page is 100 x 200: 50 pixels down is a quarter of page 1.
+    rig.keys(&["T"]);
+    let state = rig.reader.state();
+    assert!(state.webtoon && state.theater && !state.spread && state.zoom == 1.0 && state.page == 1, "{state:?}");
+    rig.frame();
+    rig.reader.wheel(Wheel { dy: -25.0, precise: true, began: true, gesture: true, scale: 2.0 }, Instant::now());
+    rig.ease();
+    assert!((rig.reader.state().offset - 0.25).abs() < 1e-9, "{:?}", rig.reader.state());
+
+    // Each key switches the width at the same place, and leaves its own mode.
+    for (key, theater) in [("t", false), ("T", true)] {
+        rig.keys(&[key]);
+        let state = rig.reader.state();
+        assert!(state.webtoon && state.theater == theater, "after {key}: {state:?}");
+        let frame = rig.frame();
+        let state = rig.reader.state();
+        assert!(state.page == 1 && (state.offset - 0.25).abs() < 1e-9, "after {key}: {state:?}");
+        assert_eq!(pixel(&frame, 0, 10).map(|pixel| pixel[3]), Some(if theater { 255 } else { 0 }), "after {key}: the strip fills the width");
+    }
+    rig.keys(&["T"]);
+    let state = rig.reader.state();
+    assert!(!state.webtoon && !state.theater && state.page == 1 && state.offset == 0.0, "{state:?}");
+    assert_eq!(rig.frame().page, 1);
     rig.keys(&["t"]);
     let state = rig.reader.state();
-    assert!(!state.webtoon && !state.theater, "{state:?}");
+    assert!(state.webtoon && !state.theater && state.page == 1, "{state:?}");
     rig.keys(&["t"]);
-    let state = rig.reader.state();
-    assert!(state.webtoon && !state.theater, "{state:?}");
+    assert!(!rig.reader.state().webtoon);
 }
 
 #[test]
@@ -271,6 +293,68 @@ fn the_wheel_scrolls_webtoon_pages_in_device_pixels() {
     rig.ease();
     let offset = rig.reader.state().offset;
     assert!((offset - 44.0 / 2000.0).abs() < 1e-4, "20 pixels for 10 points, 24 for a notch: {offset}");
+}
+
+#[test]
+fn plus_and_minus_set_the_glide_in_the_strip_modes_and_zoom_pages() {
+    let long = rig(book(pages(1, 100, 2000), None), State { webtoon: true, glide_ms: 900, ..State::default() }, (100, 80));
+    assert_eq!(long.reader.state().glide_ms, MAX_GLIDE_MS, "a glide past the longest starts at the longest");
+
+    let mut rig = rig(book(pages(1, 100, 2000), None), State { webtoon: true, ..State::default() }, (100, 80));
+    rig.keys(&["+", "="]);
+    assert_eq!(rig.reader.state().glide_ms, 360);
+    rig.keys(&["-"; 20]);
+    assert_eq!(rig.reader.state().glide_ms, 0);
+    rig.keys(&["T"]);
+    rig.keys(&["+"; 20]);
+    let state = rig.reader.state();
+    assert_eq!((state.theater, state.glide_ms, state.zoom), (true, MAX_GLIDE_MS, 1.0));
+    rig.keys(&["T", "+"]);
+    let state = rig.reader.state();
+    assert_eq!((state.webtoon, state.glide_ms, state.zoom), (false, MAX_GLIDE_MS, ZOOM_STEP), "pages zoom");
+    rig.keys(&["-"]);
+    assert_eq!((rig.reader.state().glide_ms, rig.reader.state().zoom), (MAX_GLIDE_MS, 1.0));
+}
+
+#[test]
+fn a_key_glides_for_the_glide_time_and_a_trackpad_moves_at_once() {
+    // 400 ms from the state, less two steps of `-`.
+    let state = State { webtoon: true, glide_ms: 400, ..State::default() };
+    let mut rig = rig(book(pages(1, 100, 2000), None), state, (100, 80));
+    rig.keys(&["-", "-"]);
+    rig.frame();
+    let start = Instant::now();
+    // The pixels above the view after a tick at `ms`, once its frame shows.
+    let top_at = |rig: &mut Rig, ms: u64| {
+        let before = rig.reader.state();
+        rig.reader.tick_at(start + Duration::from_millis(ms));
+        if rig.reader.state() != before {
+            rig.frame();
+        }
+        rig.reader.state().offset * 2000.0
+    };
+    rig.keys(&["j"]);
+    assert_eq!(top_at(&mut rig, 0), 0.0, "a glide starts at its first tick");
+    let half = top_at(&mut rig, 160);
+    assert!((half - 70.0).abs() < 1e-6 && rig.reader.moving(), "halfway through 320 ms eases 7/8 of 80 pixels: {half}");
+    let end = top_at(&mut rig, 320);
+    assert!((end - 80.0).abs() < 1e-6 && !rig.reader.moving(), "{end}");
+
+    rig.reader.wheel(Wheel { dy: -10.0, precise: true, began: true, gesture: true, scale: 2.0 }, start);
+    let moved = top_at(&mut rig, 330);
+    assert!((moved - 100.0).abs() < 1e-6 && !rig.reader.moving(), "10 points move 20 pixels at once: {moved}");
+}
+
+#[test]
+fn the_state_returned_carries_the_mode_and_the_glide() {
+    let mut rig = rig(book(pages(3, 50, 100), None), State::default(), (100, 80));
+    for (key, action) in [("f", Action::Return), ("Q", Action::Save), ("q", Action::Clear)] {
+        assert_eq!(rig.keys(&["T", "+", key]), Some(action));
+        let state = rig.reader.state();
+        assert!(state.webtoon && state.theater, "{key}: {state:?}");
+        rig.keys(&["T"]);
+    }
+    assert_eq!(rig.reader.state().glide_ms, 280 + 3 * 40);
 }
 
 #[test]
