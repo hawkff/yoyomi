@@ -1,13 +1,19 @@
 //! Kitty graphics with Unicode placeholders (virtual placements, `U=1`).
 //! Placeholder cells are text to the terminal, so they mix with the rest of a
-//! frame and pass through tmux panes.
+//! frame and pass through tmux panes. Outside a multiplexer the terminal can
+//! also keep an image without showing it and place any rows of it at a pixel
+//! offset inside a cell.
 
 mod diacritics;
 
+use std::io::Write as _;
+
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use flate2::Compression;
+use flate2::write::ZlibEncoder;
 use parking_lot::Mutex;
-use yoyomi_core::{CellSize, Frame, Grid, ImageId, Renderer, RendererKind, Result, RgbaImage, fit_box};
+use yoyomi_core::{CellSize, Frame, Grid, ImageId, Renderer, RendererKind, Result, RgbaImage, cells_for, fit_box};
 
 use self::diacritics::DIACRITICS;
 use crate::ops::{invert, scale};
@@ -27,10 +33,24 @@ pub fn placeholder(row: u16, col: u16) -> [char; 3] {
     ['\u{10EEEE}', DIACRITICS[usize::from(row)], DIACRITICS[usize::from(col)]]
 }
 
+/// The bytes that show `height` rows of kept image `id` from its row `top`,
+/// `width` pixels wide, `offset` pixels below the top of the cursor's cell,
+/// replacing the image's placement there was. The cursor stays.
+pub fn place(id: ImageId, width: u32, top: u32, height: u32, offset: u32) -> Vec<u8> {
+    format!("\x1b_Ga=p,i={},p=1,x=0,y={top},w={width},h={height},Y={offset},C=1,q=2\x1b\\", id.0).into_bytes()
+}
+
+/// The bytes that take away the placement `place` made of image `id`. The
+/// terminal keeps the image.
+pub fn unplace(id: ImageId) -> Vec<u8> {
+    format!("\x1b_Ga=d,d=i,i={},p=1,q=2\x1b\\", id.0).into_bytes()
+}
+
 /// Draws images through the kitty graphics protocol.
 pub struct Kitty {
     cell: Mutex<CellSize>,
     tmux: bool,
+    slides: bool,
 }
 
 /// PNG bytes per upload chunk: 3072 bytes fill the 4096 base64 bytes the
@@ -41,7 +61,24 @@ impl Kitty {
     /// A renderer for cells of `cell` pixels. With `tmux`, every command goes
     /// through tmux passthrough.
     pub fn new(cell: CellSize, tmux: bool) -> Self {
-        Kitty { cell: Mutex::new(cell), tmux }
+        Kitty { cell: Mutex::new(cell), tmux, slides: false }
+    }
+
+    /// The renderer that says, with `slides`, that the terminal places kept
+    /// images by the pixel.
+    pub fn with_slides(self, slides: bool) -> Self {
+        Kitty { slides, ..self }
+    }
+
+    /// Appends an upload of `payload` in chunks: `first` holds the keys of
+    /// the first command, and every command says whether more follow.
+    fn chunked(&self, out: &mut Vec<u8>, first: &str, payload: &[u8]) {
+        let chunks = payload.len().div_ceil(CHUNK);
+        for (i, chunk) in payload.chunks(CHUNK).enumerate() {
+            let more = u8::from(i + 1 < chunks);
+            let keys = if i == 0 { format!("{first},m={more}") } else { format!("m={more}") };
+            self.command(out, &keys, chunk);
+        }
     }
 
     /// Appends one graphics command with a base64 payload. tmux passthrough
@@ -98,13 +135,7 @@ impl Renderer for Kitty {
         // another grid otherwise keeps the old placement's geometry, and the
         // page shows half drawn.
         self.command(&mut upload, &format!("a=d,d=I,i={},q=2", id.0), &[]);
-        let chunks = png.len().div_ceil(CHUNK);
-        for (i, chunk) in png.chunks(CHUNK).enumerate() {
-            let more = u8::from(i + 1 < chunks);
-            let keys =
-                if i == 0 { format!("a=T,q=2,f=100,t=d,i={},U=1,c={},r={},m={more}", id.0, grid.cols, grid.rows) } else { format!("m={more}") };
-            self.command(&mut upload, &keys, chunk);
-        }
+        self.chunked(&mut upload, &format!("a=T,q=2,f=100,t=d,i={},U=1,c={},r={}", id.0, grid.cols, grid.rows), &png);
         Ok(Frame::Kitty { id, grid, upload: upload.into() })
     }
 
@@ -113,6 +144,34 @@ impl Renderer for Kitty {
         self.command(&mut out, &format!("a=d,d=I,i={},q=2", id.0), &[]);
         out
     }
+
+    fn slides(&self) -> bool {
+        self.slides
+    }
+
+    /// Sends raw pixels, compressed: the terminal stores what it gets, so
+    /// three bytes a pixel for opaque images save a quarter of its memory.
+    fn keep(&self, image: &RgbaImage, id: ImageId) -> Result<Frame> {
+        let cell = self.cell_size();
+        let opaque = image.pixels().all(|pixel| pixel[3] == 255);
+        let mut zlib = ZlibEncoder::new(Vec::new(), Compression::fast());
+        if opaque {
+            let rgb: Vec<u8> = image.pixels().flat_map(|pixel| [pixel[0], pixel[1], pixel[2]]).collect();
+            zlib.write_all(&rgb)?;
+        } else {
+            zlib.write_all(image.as_raw())?;
+        }
+        let data = zlib.finish()?;
+        let mut upload = Vec::with_capacity(data.len() / 3 * 4 + data.len() / CHUNK * 40 + 128);
+        // As in `render`: an upload under an id in use replaces the image
+        // and its placement whole.
+        self.command(&mut upload, &format!("a=d,d=I,i={},q=2", id.0), &[]);
+        let format = if opaque { 24 } else { 32 };
+        let (width, height) = image.dimensions();
+        self.chunked(&mut upload, &format!("a=t,q=2,f={format},o=z,t=d,i={},s={width},v={height}", id.0), &data);
+        let grid = Grid::new(cells_for(width, cell.w, u16::MAX), cells_for(height, cell.h, u16::MAX));
+        Ok(Frame::Kitty { id, grid, upload: upload.into() })
+    }
 }
 
 #[cfg(test)]
@@ -120,12 +179,13 @@ mod tests {
     use yoyomi_core::image::{self, Rgba};
 
     use super::*;
+    use crate::Sixel;
     use crate::png::tests::noise;
 
     const CELL: CellSize = CellSize { w: 8.0, h: 16.0 };
 
-    /// Joins the base64 payloads of an upload and decodes the PNG.
-    fn uploaded_image(upload: &[u8]) -> RgbaImage {
+    /// Joins the base64 payloads of an upload and decodes them.
+    fn payload(upload: &[u8]) -> Vec<u8> {
         let text = std::str::from_utf8(upload).unwrap();
         let mut payload = String::new();
         for command in text.split("_G").skip(1) {
@@ -135,7 +195,12 @@ mod tests {
                 payload.push_str(data);
             }
         }
-        image::load_from_memory(&STANDARD.decode(payload).unwrap()).unwrap().to_rgba8()
+        STANDARD.decode(payload).unwrap()
+    }
+
+    /// Decodes the PNG of an upload.
+    fn uploaded_image(upload: &[u8]) -> RgbaImage {
+        image::load_from_memory(&payload(upload)).unwrap().to_rgba8()
     }
 
     fn upload(frame: Frame) -> (Grid, Vec<u8>) {
@@ -226,6 +291,40 @@ mod tests {
         assert_eq!(commands.len(), 2, "{text:?}");
         assert!(commands.iter().all(|c| c.starts_with("\x1bPtmux;\x1b\x1b_G")));
         assert!(text.ends_with("\x1b\x1b\\\x1b\\"));
+    }
+
+    #[test]
+    fn keep_sends_raw_pixels_without_a_placement() {
+        let kitty = Kitty::new(CELL, false).with_slides(true);
+        assert!(kitty.slides() && !Kitty::new(CELL, false).slides());
+        let mut next = noise(5);
+        // Noise over 160 x 100 pixels takes several chunks even compressed.
+        let opaque = RgbaImage::from_fn(160, 100, |_, _| Rgba([next(), next(), next(), 255]));
+        let mut clear = opaque.clone();
+        clear.put_pixel(3, 4, Rgba([1, 2, 3, 0]));
+        for (image, format, raw) in [
+            (&opaque, 24, opaque.pixels().flat_map(|pixel| [pixel[0], pixel[1], pixel[2]]).collect::<Vec<u8>>()),
+            (&clear, 32, clear.as_raw().clone()),
+        ] {
+            let (grid, bytes) = upload(kitty.keep(image, ImageId(9)).unwrap());
+            // 160 x 100 pixels reach into 20 x 7 cells of 8 x 16.
+            assert_eq!(grid, Grid::new(20, 7));
+            let text = String::from_utf8(bytes.clone()).unwrap();
+            let first = format!("\x1b_Ga=d,d=I,i=9,q=2\x1b\\\x1b_Ga=t,q=2,f={format},o=z,t=d,i=9,s=160,v=100,m=1;");
+            assert!(text.starts_with(&first), "{:?}", &text[..80]);
+            assert!(!text.contains("U=1") && !text.contains("a=T") && !text.contains("a=p"));
+            assert!(text.matches("\x1b_Gm=").count() >= 1 && text.ends_with("\x1b\\"));
+            let mut inflated = Vec::new();
+            std::io::Read::read_to_end(&mut flate2::read::ZlibDecoder::new(&payload(&bytes)[..]), &mut inflated).unwrap();
+            assert!(inflated == raw, "f={format}: the payload inflates to other pixels");
+        }
+        assert!(Sixel::new(CELL, 256).keep(&opaque, ImageId(9)).is_err(), "other renderers keep nothing");
+    }
+
+    #[test]
+    fn place_and_unplace_bytes() {
+        assert_eq!(place(ImageId(4611), 2940, 1720, 1300, 17), b"\x1b_Ga=p,i=4611,p=1,x=0,y=1720,w=2940,h=1300,Y=17,C=1,q=2\x1b\\");
+        assert_eq!(unplace(ImageId(4611)), b"\x1b_Ga=d,d=i,i=4611,p=1,q=2\x1b\\");
     }
 
     #[test]

@@ -12,6 +12,7 @@ publish.workspace = true
 yoyomi-core.workspace = true
 base64.workspace = true
 fast_image_resize.workspace = true
+flate2.workspace = true
 parking_lot.workspace = true
 png.workspace = true
 rustix.workspace = true

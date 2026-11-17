@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use image::RgbaImage;
 
-use crate::{CellSize, Grid, ImageId, Pixels, Result};
+use crate::{CellSize, Error, Grid, ImageId, Pixels, Result};
 
 /// A 24-bit color.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -81,6 +81,19 @@ pub trait Renderer: Send + Sync {
     /// Bytes that free image `id` in the terminal; empty for renderers that
     /// store no images there.
     fn delete(&self, id: ImageId) -> Vec<u8>;
+
+    /// Whether the terminal can show any rows of an image it keeps at any
+    /// pixel offset.
+    fn slides(&self) -> bool {
+        false
+    }
+
+    /// Encodes `image` for the terminal to keep under `id` at one image pixel
+    /// per device pixel, without showing it. The frame's grid is the cells
+    /// the image would cover.
+    fn keep(&self, _image: &RgbaImage, _id: ImageId) -> Result<Frame> {
+        Err(Error::unsupported("this renderer keeps no images in the terminal"))
+    }
 }
 
 #[cfg(test)]

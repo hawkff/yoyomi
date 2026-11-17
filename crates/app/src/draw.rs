@@ -10,8 +10,8 @@ use ratatui::buffer::{Buffer, Cell, CellDiffOption};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use ratatui::{Frame, Terminal};
-use yoyomi_core::{At, Grid, ImageId, Layer, Rgb, Scene, Upload};
-use yoyomi_render::{MAX_CELLS, placeholder};
+use yoyomi_core::{At, CellSize, Grid, ImageId, Layer, Rgb, Scene, Upload, cells_for};
+use yoyomi_render::{MAX_CELLS, place, placeholder, unplace};
 
 use crate::app::{App, ImageBox};
 use crate::search;
@@ -68,13 +68,26 @@ pub struct Paint {
     data: Arc<[u8]>,
 }
 
+/// A kitty slice placed with its first row in screen cell (`x`, `y`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Placement {
+    id: ImageId,
+    x: u16,
+    y: u16,
+    width: u32,
+    top: u32,
+    height: u32,
+    offset: u32,
+}
+
 /// Writes one frame inside a synchronized update: the kitty uploads of the
 /// images it draws and the clipboard copy, then ratatui's diff of the cells,
-/// then the sixel images, each drawn with the cursor saved and put back. The
-/// other uploads, of frames ready ahead, follow the update, so the terminal
-/// shows the frame before it parses them.
+/// then the sixel images and the kitty slices that changed, each drawn with
+/// the cursor saved and put back. The other uploads, of frames ready ahead,
+/// follow the update, so the terminal shows the frame before it parses them.
 pub fn write_frame<W: Write>(terminal: &mut Terminal<CrosstermBackend<W>>, app: &mut App) -> io::Result<()> {
     let drawn = drawn_images(app);
+    let placements = placements(app);
     let (now, ahead): (Vec<Upload>, Vec<Upload>) = app.uploads.drain(..).partition(|upload| drawn.contains(&upload.id));
     let anew = drawn_anew(app, &drawn);
     let mut update = SyncUpdate { terminal, ended: false };
@@ -90,6 +103,8 @@ pub fn write_frame<W: Write>(terminal: &mut Terminal<CrosstermBackend<W>>, app: 
     out.write_all(BEGIN_UPDATE)?;
     for upload in anew.iter().filter(|upload| !now.iter().any(|sent| same_upload(sent, upload))).chain(&now) {
         out.write_all(&upload.bytes)?;
+        // An upload replaces the image and drops its placement.
+        app.placed.retain(|placed| placed.id != upload.id);
     }
     if let Some(clipboard) = app.take_clipboard() {
         out.write_all(&clipboard)?;
@@ -103,12 +118,52 @@ pub fn write_frame<W: Write>(terminal: &mut Terminal<CrosstermBackend<W>>, app: 
         out.write_all(&paint.data)?;
         out.write_all(b"\x1b8")?;
     }
+    place_slices(out, &mut app.placed, placements)?;
     update.end()?;
     let out = update.terminal.backend_mut();
     for upload in ahead {
         out.write_all(&upload.bytes)?;
+        app.placed.retain(|placed| placed.id != upload.id);
     }
     out.flush()
+}
+
+/// Writes what turns the kitty placements `placed` into `placements`: the
+/// removal of each one this frame does not show, and each slice that is new
+/// or moved. The terminal keeps the images.
+fn place_slices(out: &mut impl Write, placed: &mut Vec<Placement>, placements: Vec<Placement>) -> io::Result<()> {
+    for gone in placed.iter().filter(|old| !placements.iter().any(|new| new.id == old.id)) {
+        out.write_all(&unplace(gone.id))?;
+    }
+    for new in placements.iter().filter(|new| !placed.contains(new)) {
+        write!(out, "\x1b7\x1b[{};{}H", new.y + 1, new.x + 1)?;
+        out.write_all(&place(new.id, new.width, new.top, new.height, new.offset))?;
+        out.write_all(b"\x1b8")?;
+    }
+    *placed = placements;
+    Ok(())
+}
+
+/// The kitty slices of the scenes `draw` draws that fit their image box. A
+/// scene drawn for a larger box waits for its render.
+fn placements(app: &App) -> Vec<Placement> {
+    if app.help || app.pick_for.is_some() || app.menu.is_some() {
+        return Vec::new();
+    }
+    let cell = app.cell();
+    let mut placements = Vec::new();
+    for i in (0..app.pane_count()).filter(|&i| app.body_errors(i).is_empty()) {
+        let (Some(shown), image) = (app.shown(i), app.scene_box(i)) else { continue };
+        for layer in &shown.scene.layers {
+            let Layer::KittySlice { id, width, top, height, at, offset } = *layer else { continue };
+            // A pixel of slack for cells of a fractional size.
+            let fits = |cells: u16, from: u16, px: u32, size: f64| f64::from(from) * size + f64::from(px) <= f64::from(cells) * size + 1.0;
+            if fits(image.cols, at.col, width, cell.w) && fits(image.rows, at.row, offset + height, cell.h) {
+                placements.push(Placement { id, x: image.x + at.col, y: image.y + at.row, width, top, height, offset });
+            }
+        }
+    }
+    placements
 }
 
 /// The kitty images of the scenes `draw` draws.
@@ -122,7 +177,10 @@ fn drawn_images(app: &App) -> Vec<ImageId> {
 
 /// The kitty images `scene` draws.
 fn kitty_ids(scene: &Scene) -> impl Iterator<Item = ImageId> + '_ {
-    scene.layers.iter().filter_map(|layer| if let Layer::KittyRows { id, .. } = layer { Some(*id) } else { None })
+    scene.layers.iter().filter_map(|layer| match layer {
+        Layer::KittyRows { id, .. } | Layer::KittySlice { id, .. } => Some(*id),
+        _ => None,
+    })
 }
 
 /// Under tmux, the uploads of the `drawn` images the previous frame did not
@@ -193,6 +251,7 @@ pub fn draw(app: &App, frame: &mut Frame) -> Vec<Paint> {
         status(buf, app, area.height.saturating_sub(1), area.width);
     }
     let middle = body_top + body_rows.saturating_sub(1) / 2;
+    let cell = app.cell();
     let mut paints = Vec::new();
     for i in 0..app.pane_count() {
         let columns = app.pane_columns(i);
@@ -206,14 +265,14 @@ pub fn draw(app: &App, frame: &mut Frame) -> Vec<Paint> {
         let image = app.scene_box(i);
         match app.shown(i) {
             Some(shown) if !spread_errors.is_empty() => {
-                paints.extend(shown.scene.layers.iter().filter_map(|layer| draw_layer(buf, image, layer, app.sixel_fresh)));
+                paints.extend(shown.scene.layers.iter().filter_map(|layer| draw_layer(buf, image, layer, app.sixel_fresh, cell)));
                 for (half, text) in spread_errors {
                     center(buf, half, middle, &text, error);
                 }
             }
             _ if !errors.is_empty() => center(buf, columns, middle, &errors.join("; "), error),
             Some(shown) if shown.scene.layers.iter().any(|layer| image.shows(layer, area.bottom())) => {
-                paints.extend(shown.scene.layers.iter().filter_map(|layer| draw_layer(buf, image, layer, app.sixel_fresh)));
+                paints.extend(shown.scene.layers.iter().filter_map(|layer| draw_layer(buf, image, layer, app.sixel_fresh, cell)));
             }
             _ if app.empty(i) => center(buf, columns, middle, "no book", dim),
             // A spread shows its loading text in its left half.
@@ -267,8 +326,9 @@ fn help(buf: &mut Buffer, page: usize) {
 /// blank to clear what was there; later frames skip them, so the image stays.
 /// Ratatui's diff compares the diff option too, so once no image covers a
 /// cell, it is written again over the old pixels. A sixel image that
-/// `ImageBox::shows` refuses draws nothing.
-fn draw_layer(buf: &mut Buffer, image: ImageBox, layer: &Layer, sixel_fresh: bool) -> Option<Paint> {
+/// `ImageBox::shows` refuses draws nothing. A kitty slice leaves the cells it
+/// covers, `cell` pixels each, blank for the placement `write_frame` sends.
+fn draw_layer(buf: &mut Buffer, image: ImageBox, layer: &Layer, sixel_fresh: bool, cell: CellSize) -> Option<Paint> {
     let color = |Rgb(r, g, b): Rgb| Color::Rgb(r, g, b);
     match layer {
         Layer::KittyRows { id, cols, src_row, rows, at } => {
@@ -278,6 +338,12 @@ fn draw_layer(buf: &mut Buffer, image: ImageBox, layer: &Layer, sixel_fresh: boo
                 cell.set_symbol(&String::from_iter(placeholder(src_row + row, col)))
                     .set_fg(color(id.color()))
                     .set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::MIN));
+            });
+        }
+        Layer::KittySlice { width, height, at, offset, .. } => {
+            let grid = Grid::new(cells_for(*width, cell.w, u16::MAX), cells_for(offset + height, cell.h, u16::MAX));
+            each_cell(buf, image, *at, grid, |_, _, blank| {
+                blank.reset();
             });
         }
         Layer::Sixel { data, grid, at } => {
@@ -830,6 +896,53 @@ pub(crate) mod tests {
         let written = Recorder::default();
         let mut terminal = Terminal::with_options(CrosstermBackend::new(written.clone()), options).unwrap();
         assert!(write(&mut terminal, &written, &mut app).starts_with("\x1b[?2026h"));
+    }
+
+    #[test]
+    fn kitty_slices_place_after_the_cells_and_again_only_when_they_change() {
+        let (mut app, _) = app_with(Arc::new(Kitty::new(CellSize::FALLBACK, false).with_slides(true)), 20, 8);
+        open(&mut app);
+        let slice = |id, top, height, row, offset| Layer::KittySlice { id: ImageId(id), width: 160, top, height, at: At { col: 0, row }, offset };
+        let text = Layer::Text { lines: vec!["cells".to_owned()].into(), at: At { col: 0, row: 5 } };
+        app.uploads.push(Upload { id: ImageId(7), bytes: b"<seven>".as_slice().into() });
+        app.uploads.push(Upload { id: ImageId(9), bytes: b"<ahead>".as_slice().into() });
+        // The body starts on screen row 1: slice 7 fills its rows 0 to 2.5,
+        // slice 8 goes on from half of row 2.
+        app.apply(shown(vec![slice(7, 5, 40, 0, 0), slice(8, 0, 30, 2, 8), text.clone()], Vec::new()));
+        let options = TerminalOptions { viewport: Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 20, 8)) };
+        let written = Recorder::default();
+        let mut terminal = Terminal::with_options(CrosstermBackend::new(written.clone()), options).unwrap();
+        let out = write(&mut terminal, &written, &mut app);
+        let at = |needle: &str| out.find(needle).unwrap_or_else(|| panic!("{needle:?} missing from {out:?}"));
+        let seven = "\x1b7\x1b[2;1H\x1b_Ga=p,i=7,p=1,x=0,y=5,w=160,h=40,Y=0,C=1,q=2\x1b\\\x1b8";
+        let eight = "\x1b7\x1b[4;1H\x1b_Ga=p,i=8,p=1,x=0,y=0,w=160,h=30,Y=8,C=1,q=2\x1b\\\x1b8";
+        assert_eq!(at("\x1b[?2026h"), 0);
+        assert!(at("<seven>") < at("cells") && at("cells") < at(seven) && at(seven) < at(eight), "{out:?}");
+        assert!(out.ends_with(&format!("{eight}\x1b[?2026l<ahead>")), "{out:?}");
+        let (buf, _) = render(&app);
+        assert!((1..5).all(|y| (0..20).all(|x| buf[(x, y)].symbol() == " ")), "the cells under the slices are blank");
+
+        let out = write(&mut terminal, &written, &mut app);
+        assert!(!out.contains("\x1b_G"), "an unchanged frame places nothing: {out:?}");
+
+        // Slice 8 moves and slice 7 leaves: 7 is unplaced once, 8 placed anew.
+        app.apply(shown(vec![slice(8, 0, 30, 0, 9), text.clone()], Vec::new()));
+        let out = write(&mut terminal, &written, &mut app);
+        assert_eq!(out.matches("\x1b_G").count(), 2, "{out:?}");
+        assert!(out.contains("\x1b_Ga=d,d=i,i=7,p=1,q=2\x1b\\") && out.contains("\x1b[2;1H\x1b_Ga=p,i=8,p=1,x=0,y=0,w=160,h=30,Y=9,"), "{out:?}");
+        assert!(!write(&mut terminal, &written, &mut app).contains("\x1b_G"), "a slice that left is unplaced once");
+
+        // An overlay unplaces the slices, and its closing places them again.
+        for overlay in [true, false] {
+            app.help = overlay;
+            let out = write(&mut terminal, &written, &mut app);
+            assert_eq!(out.matches("\x1b_G").count(), 1, "{out:?}");
+            assert_eq!(out.contains("a=d,d=i,i=8,p=1"), overlay, "{out:?}");
+        }
+        // An upload under the id replaces the image, and the slice goes out again after it.
+        app.uploads.push(Upload { id: ImageId(8), bytes: b"<eight>".as_slice().into() });
+        let out = write(&mut terminal, &written, &mut app);
+        assert!(out.find("<eight>") < out.find("a=p,i=8") && out.contains("a=p,i=8"), "{out:?}");
     }
 
     #[test]

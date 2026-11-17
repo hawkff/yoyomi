@@ -86,6 +86,9 @@ struct View {
     request: StripRequest,
     generation: u64,
     kitty: bool,
+    /// Kitty: the terminal keeps the bands and places any of their pixel
+    /// rows, so the top of the viewport may be any pixel.
+    slides: bool,
     cols: u16,
     rows: u16,
     /// Strip pixels per terminal row.
@@ -184,7 +187,7 @@ impl Strip {
 
     /// Whether the renderer can move the picture by a pixel, so moves glide.
     pub fn slides(&self) -> bool {
-        self.cx.renderer.kind() == RendererKind::Native
+        self.cx.renderer.kind() == RendererKind::Native || self.cx.renderer.slides()
     }
 
     /// Shows the strip from `at` with `request`, anchoring it at that page.
@@ -210,6 +213,7 @@ impl Strip {
         };
         let renderer = &self.cx.renderer;
         let kitty = renderer.kind() == RendererKind::Kitty;
+        let slides = kitty && renderer.slides();
         let cell = renderer.cell_size();
         // A half-block cell shows one pixel across, so the strip composes no
         // finer than that.
@@ -230,6 +234,7 @@ impl Strip {
             request,
             generation: self.generation,
             kitty,
+            slides,
             cols,
             rows,
             cell_h,
@@ -360,7 +365,7 @@ impl Strip {
             // Placeholder cells move in whole rows. The half row left would
             // round to a whole row each way; the next scroll takes it, so two
             // half viewports make a whole one.
-            let rows = if view.kitty { view.pending.round() } else { view.pending };
+            let rows = if view.placeholders() { view.pending.round() } else { view.pending };
             view.carry = view.pending - rows;
             view.pending = 0.0;
             view.stop_glide();
@@ -380,7 +385,7 @@ impl Strip {
         if (view.top - before).abs() < 1e-9 {
             return Update::default();
         }
-        if view.kitty {
+        if view.placeholders() {
             view.align(&self.cx.resident);
         }
         let update = view.refresh(&mut self.cx);
@@ -484,6 +489,12 @@ fn scaled_size(size: Option<(u32, u32)>, request: &StripRequest, unit: f64, widt
 }
 
 impl View {
+    /// Whether kitty draws the bands with placeholder cells, which move in
+    /// whole rows of the band grid.
+    fn placeholders(&self) -> bool {
+        self.kitty && !self.slides
+    }
+
     /// Ends the glide under way, so the next move starts from rest.
     fn stop_glide(&mut self) {
         self.gliding = None;
@@ -604,11 +615,30 @@ impl View {
     }
 
     /// The bands the viewport shows, and those it keeps: the visible ones
-    /// with one band above and one below the band at the top.
+    /// with one band above and one below the band at the top. Where the
+    /// strip slides, the band below the bottom one is kept as well, so a
+    /// glide finds it ready.
     fn band_ranges(&self) -> (RangeInclusive<i64>, RangeInclusive<i64>) {
+        if self.slides {
+            let top = self.top.round() as i64;
+            let (first, last) = (self.band_at(top), self.band_at(top + i64::from(self.height) - 1));
+            return (first..=last, first - 1..=last + 1);
+        }
         let n = self.top_row();
         let (first, last) = (n.div_euclid(self.band_rows), (n + i64::from(self.rows) - 1).div_euclid(self.band_rows));
         (first..=last, first - 1..=last.max(first + 1))
+    }
+
+    /// The band that holds strip row `y`.
+    fn band_at(&self, y: i64) -> i64 {
+        let mut index = ((y as f64 - self.origin) / (self.band_rows as f64 * self.cell_h)).floor() as i64;
+        while self.band_span(index).0 > y {
+            index -= 1;
+        }
+        while self.band_span(index + 1).0 <= y {
+            index += 1;
+        }
+        index
     }
 
     /// The first strip row of band `index` and its height in strip pixels.
@@ -628,7 +658,7 @@ impl View {
         let lease = cx.resident.lease();
         let cancel = Cancel::new();
         let generation = self.generation;
-        let grid = Grid::new(self.cols, self.band_rows as u16);
+        let grid = (!self.slides).then(|| Grid::new(self.cols, self.band_rows as u16));
         cx.render(priority, &cancel, pieces, (self.width, height), lease.id, grid, move |result| Done::Band { generation, index, lease, result });
         self.bands.insert(index, Band::Rendering { lease, cancel });
     }
@@ -642,13 +672,19 @@ impl View {
         })
     }
 
-    /// The viewport as rows of the visible bands. Under tmux, `uploads` takes
-    /// the upload of every band the scene draws.
+    /// The viewport as rows of the visible bands, or where the strip slides
+    /// as slices of them. Under tmux, `uploads` takes the upload of every
+    /// band the scene draws.
     fn band_scene(&mut self, cx: &Context, uploads: &mut Vec<Upload>) -> Shown {
         let (n, rows, band_rows) = (self.top_row(), i64::from(self.rows), self.band_rows);
         let (mut layers, mut errors) = (Vec::new(), Vec::new());
         for index in self.band_ranges().0 {
-            match self.bands.get_mut(&index) {
+            match self.bands.get(&index) {
+                Some(Band::Ready { lease, errors: failed, .. }) if self.slides => {
+                    layers.extend(self.slice(index, lease.id));
+                    cx.resident.touch(*lease);
+                    errors.extend(failed.iter().cloned());
+                }
                 Some(Band::Ready { lease, frame, errors: failed }) => {
                     // Placeholder rows past the grid the renderer returned
                     // would point outside the image.
@@ -676,6 +712,36 @@ impl View {
         Shown { page: self.position().page, scene: Scene { layers }, errors }
     }
 
+    /// The rows of band `index`, kept as image `id`, that the viewport
+    /// shows, as a slice from the cell where they start; none when the band
+    /// lies outside the viewport.
+    fn slice(&self, index: i64, id: ImageId) -> Option<Layer> {
+        let top = self.top.round() as i64;
+        let (start, height) = self.band_span(index);
+        let from = top.max(start);
+        let to = (top + i64::from(self.height)).min(start + i64::from(height));
+        (to > from).then(|| {
+            let (row, offset) = self.cell_at(from - top);
+            Layer::KittySlice { id, width: self.width, top: (from - start) as u32, height: (to - from) as u32, at: At { col: 0, row }, offset }
+        })
+    }
+
+    /// The viewport row that pixel `y` of the viewport lies in, and the
+    /// pixels from the row's top to it. Row `r` starts at pixel `r * cell_h`
+    /// rounded, so slices meet without a gap also where cells have a
+    /// fractional height.
+    fn cell_at(&self, y: i64) -> (u16, u32) {
+        let cell_top = |row: i64| (row as f64 * self.cell_h).round() as i64;
+        let mut row = (y as f64 / self.cell_h).floor() as i64;
+        while cell_top(row) > y {
+            row -= 1;
+        }
+        while cell_top(row + 1) <= y {
+            row += 1;
+        }
+        (row as u16, (y - cell_top(row)) as u32)
+    }
+
     /// Kitty scrolls in whole rows of the band grid. When an end of the strip
     /// stops the viewport between rows, the grid starts again there.
     fn align(&mut self, resident: &Resident) {
@@ -700,7 +766,7 @@ impl View {
         let cancel = Cancel::new();
         self.frame_job += 1;
         let (generation, job, page) = (self.generation, self.frame_job, self.position().page);
-        let (grid, done) = (Grid::new(self.cols, self.rows), move |result| Done::Frame { generation, job, page, result });
+        let (grid, done) = (Some(Grid::new(self.cols, self.rows)), move |result| Done::Frame { generation, job, page, result });
         cx.render(Priority::Visible, &cancel, pieces, (self.width, self.height), ImageId(0), grid, done);
         self.frame = Some(cancel);
         self.waiting = true;
@@ -718,7 +784,7 @@ impl View {
             self.pending = 0.0;
             self.stop_glide();
             self.carry = 0.0;
-            if self.kitty {
+            if self.placeholders() {
                 self.align(&cx.resident);
             }
         }
@@ -798,7 +864,8 @@ impl Context {
     }
 
     /// Composes `pieces` into an image of `size` and renders it into `grid`
-    /// on a job; `done` wraps the result for `events`.
+    /// on a job, or without a grid keeps it in the terminal at one pixel per
+    /// device pixel; `done` wraps the result for `events`.
     #[allow(clippy::too_many_arguments, reason = "one call site per strip mode passes the job's whole input")]
     fn render(
         &self,
@@ -807,7 +874,7 @@ impl Context {
         pieces: Vec<Piece>,
         (width, height): (u32, u32),
         id: ImageId,
-        grid: Grid,
+        grid: Option<Grid>,
         done: impl FnOnce(Result<(Frame, Vec<String>)>) -> Done + Send + 'static,
     ) {
         let (book, scaled, renderer, events, source) =
@@ -815,8 +882,13 @@ impl Context {
         let job_cancel = cancel.clone();
         let refuse_text = renderer.kind() == RendererKind::HalfBlock;
         self.jobs.spawn(priority, cancel, move || {
-            let result = compose(&book, &scaled, &pieces, (width, height), refuse_text, &job_cancel)
-                .and_then(|(image, errors)| Ok((renderer.render(&image, id, grid, false)?, errors)));
+            let result = compose(&book, &scaled, &pieces, (width, height), refuse_text, &job_cancel).and_then(|(image, errors)| {
+                let frame = match grid {
+                    Some(grid) => renderer.render(&image, id, grid, false)?,
+                    None => renderer.keep(&image, id)?,
+                };
+                Ok((frame, errors))
+            });
             // The app may have dropped the receiver while it shuts down.
             let _ = events.send(ViewEvent::new(source, done(result)));
         });

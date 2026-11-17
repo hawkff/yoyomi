@@ -39,10 +39,14 @@ struct Session {
 
 impl Session {
     fn open(fixture: &str) -> Self {
+        Self::open_on(fixture, Kitty::new(CellSize::FALLBACK, false))
+    }
+
+    fn open_on(fixture: &str, renderer: Kitty) -> Self {
         let (events, received) = unbounded();
         let (view_events, view_received) = unbounded();
         let resident = Arc::new(Resident::new(ImageIds::with_base(0x100), false));
-        let renderer = Arc::new(Kitty::new(CellSize::FALLBACK, false));
+        let renderer = Arc::new(renderer);
         let mut app = App::new(renderer, Terminal::default(), resident.clone(), Positions::load_from(None), events, view_events, (80, 24));
         app.open_books(&[Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata").join(fixture)]);
         app.on_event(received.recv_timeout(WAIT).expect("the book opens"));
@@ -199,4 +203,39 @@ fn webtoon_scrolling_uploads_only_new_bands() {
     assert_eq!(uploads(&frames), 1, "{frames:?}");
     assert_eq!(session.uploaded.len(), 5);
     assert!(session.on_screen().contains(&session.uploaded[4]));
+}
+
+/// Uploads of images the terminal keeps without showing them.
+fn kept(frames: &str) -> usize {
+    frames.matches("a=t,").count()
+}
+
+fn placements(frames: &str) -> usize {
+    frames.matches("a=p,").count()
+}
+
+#[test]
+fn a_sliding_webtoon_scrolls_with_placements_and_uploads_only_new_bands() {
+    let mut session = Session::open_on("webtoon.cbz", Kitty::new(CellSize::FALLBACK, false).with_slides(true));
+    session.until(|session| session.uploaded.len() == 2);
+    // The viewport's band and the band below it, placed by the pixel.
+    let frames = session.press("t") + &session.until(|session| kept(&session.written.text()) == 2 && session.app.deadline().is_none());
+    assert!(placements(&frames) >= 1, "{frames:?}");
+    assert!(!frames.contains("U=1"));
+
+    // Half a viewport down glides over frames and readies the band below
+    // the new bottom; a viewport more readies the next one. Each move
+    // uploads one band and places slices on its way.
+    for (key, bands) in [("J", 3), ("j", 4)] {
+        let frames = session.press(key) + &session.until(|session| kept(&session.written.text()) == bands && session.app.deadline().is_none());
+        assert_eq!(kept(&frames), 1, "{key}: {frames:?}");
+        assert!(placements(&frames) >= 1, "{key} moves by placements: {frames:?}");
+        assert!(!frames.contains('\u{10EEEE}'), "{key} writes no placeholder cells");
+    }
+    let slices = |session: &Session| {
+        let shown = session.app.shown(0).expect("the strip");
+        shown.scene.layers.iter().filter(|layer| matches!(layer, Layer::KittySlice { .. })).count()
+    };
+    assert!(slices(&session) >= 1);
+    assert_eq!(placements(&session.frame()), 0, "a frame at rest places nothing");
 }

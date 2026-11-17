@@ -86,6 +86,13 @@ impl Resident {
     pub fn ids(&self) -> impl Iterator<Item = ImageId> {
         self.ids.all()
     }
+
+    /// The ids no lease holds now. An image the terminal keeps under one of
+    /// them shows nothing anyone asked for.
+    pub fn idle(&self) -> Vec<ImageId> {
+        let state = self.state.lock();
+        self.ids.all().filter(|id| !state.leases.contains_key(id)).collect()
+    }
 }
 
 #[cfg(test)]
@@ -113,5 +120,15 @@ mod tests {
         assert_eq!(again.id, lease.id);
         assert_ne!(again, lease, "a new lease on the same id is a different claim");
         assert!(resident.resend());
+    }
+
+    #[test]
+    fn idle_ids_are_those_no_lease_holds() {
+        let resident = Resident::new(ImageIds::with_base(0x100), false);
+        let (kept, released) = (resident.lease(), resident.lease());
+        resident.release(released);
+        let idle = resident.idle();
+        assert_eq!(idle.len(), ImageIds::PER_PROCESS as usize - 1);
+        assert!(!idle.contains(&kept.id) && idle.contains(&released.id));
     }
 }

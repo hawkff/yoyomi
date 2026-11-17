@@ -20,7 +20,7 @@ use yoyomi_state::{BookKey, Bookmarks, Position, Positions, Settings};
 use yoyomi_view::{PageRequest, Pager, Resident, Shown, Strip, StripPosition, StripRequest, Update, ViewEvent};
 use yoyomi_web::Server;
 
-use crate::draw::{self, safe_text};
+use crate::draw::{self, Placement, safe_text};
 use crate::menus::{Action, Kind, Menu};
 use crate::picker::{Picked, Picker};
 use crate::search::{self, LineKey};
@@ -228,6 +228,11 @@ pub struct App {
     pub sixel_fresh: bool,
     /// Under tmux, the uploads of the images the last frame drew.
     pub drawn: Vec<Upload>,
+    /// The kitty slices the last frame left placed.
+    pub placed: Vec<Placement>,
+    /// A sliding strip mode began: once its first frame shows, the images
+    /// under ids no lease holds leave the terminal.
+    purge: bool,
     /// When the resize settles, and the cell size its first render used.
     settle: Option<(Instant, CellSize)>,
     last_tick: Instant,
@@ -288,6 +293,8 @@ impl App {
             uploads: Vec::new(),
             sixel_fresh: false,
             drawn: Vec::new(),
+            placed: Vec::new(),
+            purge: false,
             settle: None,
             last_tick: Instant::now(),
             quit: None,
@@ -383,6 +390,7 @@ impl App {
         };
         self.panes[i].page = page.min(last);
         if self.webtoon {
+            self.start_sliding();
             self.show_strip_again((StripPosition { page: page.min(last), offset }, scroll, 0.0));
         } else {
             self.show_pane(i);
@@ -698,6 +706,14 @@ impl App {
         } else {
             self.uploads.extend(uploads);
         }
+        if self.purge && self.webtoon {
+            self.purge = false;
+            // The deletes go out after the frame that draws the strip, as
+            // uploads of images it does not draw; the bands it draws hold
+            // their ids.
+            let deletes = self.resident.idle().into_iter().map(|id| Upload { id, bytes: self.renderer.delete(id).into() });
+            self.uploads.extend(deletes);
+        }
         self.sixel_fresh = self.sixel_fresh || shown.scene.layers.iter().any(|layer| matches!(layer, Layer::Sixel { .. }));
         let spread = self.spread && !self.split;
         let pane = &mut self.panes[i];
@@ -906,9 +922,23 @@ impl App {
         self.theater = theater && self.webtoon;
         self.panes[active].reset_view();
         if self.webtoon {
+            self.start_sliding();
             self.show_strip(StripPosition { page: self.panes[active].page, offset: 0.0 });
         } else {
             self.show();
+        }
+    }
+
+    /// Where the active pane's strip slides, drops the pager's frames, which
+    /// page mode renders again, and marks the images no lease holds then for
+    /// leaving the terminal: page frames and the strip's bands together
+    /// pass the image memory of some terminals, which then drop a band.
+    fn start_sliding(&mut self) {
+        if let Some(reader) = &mut self.panes[self.active].reader
+            && self.renderer.slides()
+        {
+            reader.pager.clear();
+            self.purge = true;
         }
     }
 
@@ -1270,6 +1300,7 @@ impl App {
         }
         self.sixel_fresh = true;
         if self.webtoon {
+            self.start_sliding();
             self.show_strip(StripPosition { page: state.page, offset: state.offset });
         } else {
             self.show_all();
@@ -1712,6 +1743,7 @@ fn scroll_distance(viewport_rows: u16, fraction: f64) -> f64 {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
 
     use crossbeam_channel::{Receiver, at, never, select, unbounded};
@@ -2230,10 +2262,15 @@ pub(crate) mod tests {
     /// view jobs. With `tmux`, uploads go out with the frames that draw them
     /// and a resize renders again.
     fn kitty_reader(name: &str, tmux: bool) -> (App, Receiver<ViewEvent>) {
+        kitty_reader_on(Kitty::new(CellSize::FALLBACK, false), name, tmux)
+    }
+
+    /// An 80 x 24 reader of the fixture `name` on `renderer`, as `kitty_reader`.
+    fn kitty_reader_on(renderer: Kitty, name: &str, tmux: bool) -> (App, Receiver<ViewEvent>) {
         let (events, received) = unbounded();
         let (view_events, view_received) = unbounded();
         let resident = Arc::new(Resident::new(ImageIds::with_base(0x100), tmux));
-        let renderer = Arc::new(Kitty::new(CellSize::FALLBACK, false));
+        let renderer = Arc::new(renderer);
         let mut app = App::new(renderer, Terminal::default(), resident, Positions::load_from(None), events, view_events, (80, 24));
         app.open_books(&[fixture(name)]);
         app.on_event(received.recv_timeout(Duration::from_secs(20)).expect("the book opens"));
@@ -2322,6 +2359,79 @@ pub(crate) mod tests {
             assert!(!app.help && on_page(0)(&app));
             assert_eq!(frame(&mut app).matches(&page0).count(), usize::from(tmux), "tmux {tmux}: help closed");
         }
+    }
+
+    #[test]
+    fn a_sliding_strip_deletes_the_idle_images_once_its_first_frame_shows() {
+        for slides in [true, false] {
+            let (mut app, views) = kitty_reader_on(Kitty::new(CellSize::FALLBACK, false).with_slides(slides), "nested.cbz", false);
+            let options = TerminalOptions { viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)) };
+            let written = Recorder::default();
+            let mut terminal = ratatui::Terminal::with_options(CrosstermBackend::new(written.clone()), options).unwrap();
+            let pages = |written: &Recorder| written.text().split("a=T,").skip(1).map(id_in).collect::<BTreeSet<u32>>();
+            // Page 4 shows, and the pager keeps all five pages; the loop
+            // writes a frame after every event.
+            for want in 2..=5 {
+                if want > 2 {
+                    keys(&mut app, "j");
+                }
+                while pages(&written).len() < want {
+                    app.on_view_event(views.recv_timeout(Duration::from_secs(20)).expect("the pages render"));
+                    write_frame(&mut terminal, &mut app).unwrap();
+                }
+            }
+            let pages = pages(&written);
+
+            keys(&mut app, "t");
+            let before = written.text().len();
+            write_frame(&mut terminal, &mut app).unwrap();
+            while app.panes[0].loading {
+                app.on_view_event(views.recv_timeout(Duration::from_secs(20)).expect("the strip renders"));
+                if app.panes[0].loading {
+                    write_frame(&mut terminal, &mut app).unwrap();
+                }
+            }
+            // The strip's first frame.
+            let idle: BTreeSet<u32> = app.resident.idle().into_iter().map(|id| id.0).collect();
+            let first = written.text().len();
+            write_frame(&mut terminal, &mut app).unwrap();
+            let text = written.text();
+            let (waiting, frame) = (&text[before..first], &text[first..]);
+            let end = frame.find("\x1b[?2026l").expect("the frame ends");
+            let shown = app.shown(0).expect("the strip").scene.layers.iter();
+            let drawn: Vec<u32> = shown.filter_map(|layer| if let Layer::KittySlice { id, .. } = layer { Some(id.0) } else { None }).collect();
+            assert_eq!(drawn.is_empty(), !slides);
+            let delete = |id: u32| format!("a=d,d=I,i={id},q=2");
+            let left: Vec<u32> = pages.iter().copied().filter(|id| idle.contains(id)).collect();
+            assert_eq!(left.is_empty(), !slides, "pages {pages:?}, idle {left:?}");
+            for id in left {
+                assert!(!waiting.contains(&delete(id)), "page {id} stays until the strip shows");
+                assert_eq!(frame.matches(&delete(id)).count(), 1, "page {id} leaves once");
+                assert!(frame.find(&delete(id)) > Some(end), "page {id} leaves after the strip's frame");
+            }
+            for id in drawn {
+                assert!(!idle.contains(&id) && !frame[end..].contains(&delete(id)), "band {id} stays");
+            }
+            if !slides {
+                assert!(pages.iter().all(|&id| !text[before..].contains(&delete(id))), "the pager keeps its pages without a slide");
+            }
+        }
+    }
+
+    #[test]
+    fn a_strip_mode_from_the_native_window_starts_sliding_too() {
+        for slides in [true, false] {
+            let (mut app, _views) = kitty_reader_on(Kitty::new(CellSize::FALLBACK, false).with_slides(slides), "nested.cbz", false);
+            app.native_return(yoyomi_native::State { webtoon: true, theater: true, ..yoyomi_native::State::default() });
+            assert_eq!(app.purge, slides, "the images page mode left go once the strip shows");
+            app.native_return(yoyomi_native::State::default());
+        }
+    }
+
+    /// The kitty image id in the keys `keys` start with, after `i=`.
+    fn id_in(keys: &str) -> u32 {
+        let id = &keys[keys.find("i=").expect("an image id") + 2..];
+        id[..id.find(',').expect("more keys")].parse().expect("a number")
     }
 
     /// Runs the event loop on finished view jobs and timers until `done`.

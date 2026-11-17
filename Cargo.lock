@@ -2443,6 +2443,7 @@ version = "0.0.1"
 dependencies = [
  "base64 0.23.1",
  "fast_image_resize",
+ "flate2",
  "parking_lot",
  "png",
  "rustix",

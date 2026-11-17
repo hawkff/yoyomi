@@ -28,6 +28,7 @@ crossterm = "0.29.0"
 dispatch2 = { version = "0.3.1", default-features = false, features = ["std"] }
 encoding_rs = "0.8.35"
 fast_image_resize = "6.1.0"
+flate2 = "1.1.11"
 fontdb = { version = "0.23.0", default-features = false, features = ["std"] }
 image = { version = "0.25.10", default-features = false, features = ["bmp", "gif", "jpeg", "png", "pnm", "webp"] }
 libc = "0.2.191"
