@@ -176,7 +176,7 @@ fn harness(book: Arc<Pages>, renderer: Arc<dyn Renderer>, resend: bool) -> Harne
 }
 
 fn request(cols: u16, rows: u16) -> StripRequest {
-    StripRequest { grid: Grid::new(cols, rows), quarter_turns: 0, invert: false }
+    StripRequest { grid: Grid::new(cols, rows), quarter_turns: 0, invert: false, fill: false }
 }
 
 impl Harness {
@@ -516,6 +516,48 @@ fn wide_pages_shrink_and_narrow_pages_keep_their_size_centered() {
     assert_eq!(pixel(&frame, 69, 60), [1, 10, 0, 255]);
     assert_eq!(pixel(&frame, 29, 60), CLEAR);
     assert_eq!(pixel(&frame, 70, 60), CLEAR);
+}
+
+#[test]
+fn fill_scales_every_page_to_the_viewport_width() {
+    let pages = vec![solid(40, 20, RED), solid(200, 100, BLUE), solid(100, 100, GREEN)];
+    let sixel = Recorder::new(RendererKind::Sixel, PIXEL);
+    let mut h = harness(Pages::new(pages.clone()), sixel.clone(), false);
+    h.show(0, 0.0, StripRequest { fill: true, ..request(100, 100) });
+    // The narrow page grows to 100 x 50, and the wide one shrinks to 100 x 50
+    // right under it.
+    let frame = sixel.last();
+    assert_eq!(pixel(&frame, 0, 0), RED);
+    assert_eq!(pixel(&frame, 99, 49), RED);
+    assert_eq!(pixel(&frame, 0, 50), BLUE);
+    assert_eq!(pixel(&frame, 99, 99), BLUE);
+    h.scroll(55.0);
+    assert_position(&h, 1, 0.1);
+
+    // Without fill the narrow page keeps its 40 x 20 and the wide one still
+    // shrinks.
+    let mut h = harness(Pages::new(pages), sixel.clone(), false);
+    h.show(0, 0.0, request(100, 100));
+    let frame = sixel.last();
+    assert_eq!(pixel(&frame, 50, 10), RED);
+    assert_eq!(pixel(&frame, 0, 10), CLEAR);
+    assert_eq!(pixel(&frame, 0, 20), BLUE);
+    assert_eq!(pixel(&frame, 99, 69), BLUE);
+    assert_eq!(pixel(&frame, 50, 70), GREEN);
+}
+
+#[test]
+fn half_blocks_fill_the_viewport_width() {
+    let half = Recorder::new(RendererKind::HalfBlock, CELL);
+    let mut h = harness(Pages::new(vec![solid(40, 400, RED)]), half.clone(), false);
+    // 25 cells across compose 25 pixels wide; the 40-pixel page fills them
+    // rather than shrinking to one pixel per cell.
+    h.show(0, 0.0, StripRequest { fill: true, ..request(25, 25) });
+    let frame = half.last();
+    assert_eq!(frame.dimensions(), (25, 50));
+    assert_eq!(pixel(&frame, 0, 10), RED);
+    assert_eq!(pixel(&frame, 24, 49), RED);
+    assert_eq!(h.view().layout.page_at(0.0).height, 250);
 }
 
 #[test]

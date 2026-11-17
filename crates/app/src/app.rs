@@ -644,7 +644,7 @@ impl App {
     fn show_strip(&mut self, at: StripPosition) {
         let i = self.active;
         let pane = &self.panes[i];
-        let request = StripRequest { grid: self.grid(i), quarter_turns: pane.quarter_turns, invert: pane.invert };
+        let request = StripRequest { grid: self.grid(i), quarter_turns: pane.quarter_turns, invert: pane.invert, fill: false };
         let Some(reader) = &mut self.panes[i].reader else { return };
         let update = reader.strip.show(at, request);
         self.apply(update);
