@@ -2382,7 +2382,7 @@ checksum = "ac366ea532fa8ee6a992cec9dea525b1dc284e69702f36c2ab5fbebadc81ec86"
 
 [[package]]
 name = "yoyomi"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "base64 0.23.1",
  "crossbeam-channel",
@@ -2402,7 +2402,7 @@ dependencies = [
 
 [[package]]
 name = "yoyomi-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "image",
  "parking_lot",
@@ -2411,7 +2411,7 @@ dependencies = [
 
 [[package]]
 name = "yoyomi-formats"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "parking_lot",
  "rars",
@@ -2423,7 +2423,7 @@ dependencies = [
 
 [[package]]
 name = "yoyomi-native"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "crossbeam-channel",
  "dispatch2",
@@ -2439,7 +2439,7 @@ dependencies = [
 
 [[package]]
 name = "yoyomi-render"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "base64 0.23.1",
  "fast_image_resize",
@@ -2452,7 +2452,7 @@ dependencies = [
 
 [[package]]
 name = "yoyomi-search"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "crossbeam-channel",
  "yoyomi-core",
@@ -2460,7 +2460,7 @@ dependencies = [
 
 [[package]]
 name = "yoyomi-state"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "libc",
  "serde",
@@ -2471,7 +2471,7 @@ dependencies = [
 
 [[package]]
 name = "yoyomi-text"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "base64 0.23.1",
  "cosmic-text",
@@ -2488,7 +2488,7 @@ dependencies = [
 
 [[package]]
 name = "yoyomi-view"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "crossbeam-channel",
  "parking_lot",
@@ -2500,7 +2500,7 @@ dependencies = [
 
 [[package]]
 name = "yoyomi-web"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "parking_lot",
  "rustix",
