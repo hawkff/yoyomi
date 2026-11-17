@@ -20,6 +20,8 @@ pub struct State {
     /// In webtoon mode, the fraction of `page` above the top of the view.
     pub offset: f64,
     pub webtoon: bool,
+    /// In webtoon mode, every page fills the width of the view.
+    pub theater: bool,
     pub quarter_turns: u8,
     pub zoom: f64,
     pub center: (f64, f64),
@@ -29,7 +31,7 @@ pub struct State {
 
 impl Default for State {
     fn default() -> Self {
-        State { page: 0, offset: 0.0, webtoon: false, quarter_turns: 0, zoom: 1.0, center: (0.5, 0.5), spread: false, invert: false }
+        State { page: 0, offset: 0.0, webtoon: false, theater: false, quarter_turns: 0, zoom: 1.0, center: (0.5, 0.5), spread: false, invert: false }
     }
 }
 

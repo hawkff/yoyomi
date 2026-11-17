@@ -29,7 +29,7 @@ Book text: images with kitty or sixel graphics, plain text elsewhere (webtoon ne
   f              open active book in native macOS fullscreen (f returns)
   z              toggle terminal focus mode (hide titles and status bar)
   t              toggle continuous webtoon mode (single pane)
-  T              toggle theater mode: pages fill the width, j / k step through each page
+  T              toggle theater mode: webtoon with every page as wide as the pane
   w              switch pane
   v              toggle split          (keeps the active pane)
   s              toggle two-page spread (single pane)

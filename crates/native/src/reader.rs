@@ -298,7 +298,7 @@ impl Reader {
         let Some(grid) = self.size else { return };
         let state = &self.state;
         if state.webtoon {
-            let request = StripRequest { grid, quarter_turns: state.quarter_turns, invert: state.invert, fill: false };
+            let request = StripRequest { grid, quarter_turns: state.quarter_turns, invert: state.invert, fill: state.theater };
             let update = self.strip.show(self.at(), request);
             self.strip_shown = true;
             self.apply(update, true);
