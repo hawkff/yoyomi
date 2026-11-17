@@ -524,10 +524,15 @@ the bands coming into reach upload.
 Outside a multiplexer the terminal keeps each band as an image without a
 placement, and a frame shows the rows in view through placements at a pixel
 offset. A placement sent again replaces the one before, so a frame of a
-glide costs one short command per band. Terminals keep a limited amount of
-image data and drop images past it. yoyomi deletes an image once no frame
-on screen draws it and no view keeps it, and never before the frame that
-replaces it is on screen.
+glide costs one short command per band. A band is only as wide as its
+pages.
+
+Terminals keep a limited amount of image data and drop images past it, so
+yoyomi keeps its images there within 64 MiB. It deletes an image once no
+frame on screen draws it and no view keeps it, and never before the frame
+that replaces it is on screen. Past 64 MiB the images shown longest ago go
+first, and the next page or band loads ahead only while it fits. The band
+in the direction of the last move loads before the one behind.
 
 Inside tmux the bands sit in placeholder cells, which move by whole rows,
 so a move draws the new screen at once. Sixel and half blocks send one new
@@ -606,7 +611,7 @@ scans and a webtoon of 800 × 6000 pages.
 | Renderer | Action | Time | Data sent |
 |---|---|---|---|
 | kitty | page turn | 1 ms | placeholder cells; the page was in the terminal already |
-| kitty | webtoon `j` | 0.29 s | 3.1 MiB |
+| kitty | webtoon `j` | 0.29 s | 2.5 MiB |
 | sixel | page turn | 5 ms | one sixel image |
 | sixel | webtoon `j` | 30 ms | 0.5 MiB |
 | halfblock | page turn | 2 ms | one screen of cells |
