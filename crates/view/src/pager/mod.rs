@@ -9,8 +9,9 @@ use crossbeam_channel::Sender;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 use yoyomi_core::{
-    At, Book, Cancel, Frame, Grid, ImageId, Jobs, Layer, PageCache, PageKind, Priority, Renderer, RendererKind, Result, Transform, Upload,
+    At, Book, Cancel, Frame, Grid, ImageId, Jobs, Layer, PageCache, PageKind, Priority, Renderer, RendererKind, Result, Transform, Upload, fit_box,
 };
+use yoyomi_render::MAX_CELLS;
 
 use crate::{Lease, Resident, Shown, Update, ViewEvent, next_source};
 
@@ -453,12 +454,18 @@ impl Drop for Pager {
 }
 
 /// Decodes, transforms and renders one frame. Kitty frames take a lease
-/// into `claim` right before rendering, so cancelled work holds no id.
+/// into `claim` right before rendering, so cancelled work holds no id, for
+/// the four bytes a pixel of the bitmap kitty fits to the frame's cells.
 fn render(book: &PageCache, renderer: &dyn Renderer, claim: &mut Claim, key: &FrameKey, cancel: &Cancel) -> Result<Frame> {
     let pixels = book.page(key.page, cancel)?;
     let (image, invert) = yoyomi_render::apply(&pixels, &key.transform);
     cancel.check()?;
-    let lease = (renderer.kind() == RendererKind::Kitty).then(|| claim.resident.lease());
+    let lease = (renderer.kind() == RendererKind::Kitty).then(|| {
+        let cell = renderer.cell_size();
+        let grid = fit_box(image.width(), image.height(), Grid::new(key.max.cols.min(MAX_CELLS), key.max.rows.min(MAX_CELLS)), cell).grid;
+        let side = |cells: u16, size: f64| (f64::from(cells) * size).round() as u64;
+        claim.resident.lease(4 * side(grid.cols, cell.w) * side(grid.rows, cell.h))
+    });
     claim.lease = lease;
     renderer.render(&image, lease.map_or(ImageId(0), |lease| lease.id), key.max, invert)
 }

@@ -202,8 +202,12 @@ struct Harness {
 }
 
 fn harness(book: Arc<Pages>, renderer: Arc<dyn Renderer>, resend: bool) -> Harness {
+    harness_on(book, renderer, Resident::new(ImageIds::with_base(0x100), resend))
+}
+
+fn harness_on(book: Arc<Pages>, renderer: Arc<dyn Renderer>, resident: Resident) -> Harness {
     let (sender, events) = unbounded();
-    let resident = Arc::new(Resident::new(ImageIds::with_base(0x100), resend));
+    let resident = Arc::new(resident);
     let strip = Strip::new(Arc::new(PageCache::new(book)), renderer, Jobs::new(2), resident.clone(), sender);
     Harness { strip, events, resident }
 }
@@ -580,6 +584,27 @@ fn a_sliding_glide_of_one_viewport_uploads_only_the_band_that_comes_into_reach()
     assert_eq!(h.view().top, 160.0);
     assert_eq!(uploads, [h.band(2).id], "only the band below the viewport's new bottom uploads");
     assert!(offsets.len() > 3, "the view moves by the pixel: {offsets:?}");
+}
+
+#[test]
+fn bands_around_the_viewport_wait_for_room_in_the_budget() {
+    // Bands of 80 x 160 pixels count 51,200 bytes; the budget holds two and
+    // a half.
+    let resident = Resident::new(ImageIds::with_base(0x100), false).with_budget(128_000);
+    let mut h = harness_on(Pages::new((0..20).map(|i| rows_page(i, 80, 400)).collect()), Recorder::sliding(CELL), resident);
+    h.show(0, 0.0, request(10, 10));
+    let old = h.band(0);
+    h.band(1);
+    // The app pins the band on screen while the strip jumps.
+    h.resident.pin([old.id]);
+    assert!(h.show(10, 0.0, request(10, 10)).shown.is_some(), "the band in view comes past the budget");
+    assert_eq!(h.view().bands.len(), 1, "the bands around it wait");
+    h.resident.pin([h.band(0).id]);
+    assert_eq!(h.resident.take_freed(), [old.id]);
+    h.strip.room_freed();
+    h.settle(Update::default());
+    h.band(1);
+    assert!(!h.view().bands.contains_key(&-1), "the band below comes first and fills the budget");
 }
 
 #[test]

@@ -398,7 +398,7 @@ fn a_frame_whose_id_went_elsewhere_renders_again() {
     let i = rig.pager.frames.iter().position(|cached| cached.key.page == 1).expect("page 1 is ready");
     let lease = rig.pager.frames[i].lease.expect("kitty frames hold a lease");
     rig.resident.release(lease);
-    let other = rig.resident.lease();
+    let other = rig.resident.lease(0);
     assert!(rig.pager.show(request(1, false)).shown.is_none(), "page 1 renders again");
     let updates = rig.settle();
     assert_eq!(shown(updates.clone()).page, 1);
@@ -464,9 +464,9 @@ fn a_frame_whose_id_went_elsewhere_while_rendering_renders_again() {
     let late = rig.events.recv_timeout(Duration::from_secs(5)).expect("page 0 rendered");
     let lost = lease_of(&late).expect("kitty jobs hold a lease");
     // With every id taken, the next lease takes the least recently shown one.
-    let mut thief = rig.resident.lease();
+    let mut thief = rig.resident.lease(0);
     for _ in 1..ImageIds::PER_PROCESS {
-        thief = rig.resident.lease();
+        thief = rig.resident.lease(0);
     }
     assert_eq!(thief.id, lost.id);
     let update = rig.pager.on_event(late).expect("the pager's own event");

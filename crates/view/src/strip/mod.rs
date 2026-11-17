@@ -415,6 +415,16 @@ impl Strip {
         ((0.0..1.0).contains(&fx) && (0.0..1.0).contains(&fy)).then_some((placed.page, fx, fy))
     }
 
+    /// Starts the bands around the viewport that waited for room in the
+    /// image budget, as after images left the terminal.
+    pub fn room_freed(&mut self) {
+        if let Some(view) = &mut self.view
+            && view.kitty
+        {
+            view.request_bands(&mut self.cx);
+        }
+    }
+
     /// Takes a finished job of this strip, or hands back an event it did not
     /// start.
     pub fn on_event(&mut self, event: ViewEvent) -> Result<Update, ViewEvent> {
@@ -595,7 +605,9 @@ impl View {
             }
             keep
         });
-        for index in wanted {
+        // The visible bands, then the ones below, which reading reaches first.
+        let (below, above) = (visible.end() + 1..=*wanted.end(), *wanted.start()..*visible.start());
+        for index in visible.clone().chain(below).chain(above) {
             if !self.bands.contains_key(&index) && self.covers_band(index) {
                 let priority = if visible.contains(&index) { Priority::Visible } else { Priority::Neighbor };
                 self.render_band(cx, index, priority);
@@ -648,14 +660,16 @@ impl View {
         (start(index), (start(index + 1) - start(index)) as u32)
     }
 
-    /// Starts rendering band `index`, unless no page reaches into it.
+    /// Starts rendering band `index`, unless no page reaches into it or, for
+    /// a band around the viewport, the image budget has no room for it.
     fn render_band(&mut self, cx: &Context, index: i64, priority: Priority) {
         let (y, height) = self.band_span(index);
         let pieces = self.pieces(&cx.book, y, height);
-        if pieces.is_empty() {
+        let bytes = 4 * u64::from(self.width) * u64::from(height);
+        if pieces.is_empty() || (priority == Priority::Neighbor && !cx.resident.room(bytes)) {
             return;
         }
-        let lease = cx.resident.lease();
+        let lease = cx.resident.lease(bytes);
         let cancel = Cancel::new();
         let generation = self.generation;
         let grid = (!self.slides).then(|| Grid::new(self.cols, self.band_rows as u16));
@@ -808,6 +822,18 @@ impl View {
                     return update;
                 }
                 let band = match result {
+                    // The budget took the id while the band rendered; its
+                    // upload would replace another image.
+                    Ok(_) if !cx.resident.holds(lease) => {
+                        self.bands.remove(&index);
+                        if self.waiting {
+                            self.request_bands(cx);
+                            if self.bands_ready() {
+                                update.shown = Some(self.band_scene(cx, &mut update.uploads));
+                            }
+                        }
+                        return update;
+                    }
                     Ok((frame, errors)) => {
                         // Under tmux a band goes out with the frames that draw it.
                         if !cx.resident.resend() {

@@ -734,11 +734,18 @@ impl App {
 
     /// Where the renderer slides, queues a delete of every image whose id
     /// was given back and no frame on screen draws. No frame draws them, so
-    /// `write_frame` sends the deletes after its frame.
+    /// `write_frame` sends the deletes after its frame. The bands that
+    /// waited for room in the image budget then start.
     pub(crate) fn delete_freed(&mut self) {
         if self.renderer.slides() {
-            let deletes = self.resident.take_freed().into_iter().map(|id| Upload { id, bytes: self.renderer.delete(id).into() });
-            self.uploads.extend(deletes);
+            let freed = self.resident.take_freed();
+            if !freed.is_empty()
+                && self.webtoon
+                && let Some(reader) = &mut self.panes[self.active].reader
+            {
+                reader.strip.room_freed();
+            }
+            self.uploads.extend(freed.into_iter().map(|id| Upload { id, bytes: self.renderer.delete(id).into() }));
         }
     }
 
@@ -2406,6 +2413,8 @@ pub(crate) mod tests {
     struct Gated {
         kitty: Kitty,
         gate: std::sync::Mutex<Option<Gate>>,
+        /// The page number at the top of each image rendered or kept.
+        tops: std::sync::Mutex<Vec<u8>>,
     }
 
     /// An image held back reports on `held` and waits until the sender of
@@ -2426,7 +2435,9 @@ pub(crate) mod tests {
         }
 
         fn wait(&self, image: &RgbaImage) {
-            let gate = self.gate.lock().unwrap().take_if(|gate| image.get_pixel(image.width() / 2, 0)[0] == gate.page);
+            let top = image.get_pixel(image.width() / 2, 0)[0];
+            self.tops.lock().unwrap().push(top);
+            let gate = self.gate.lock().unwrap().take_if(|gate| top == gate.page);
             if let Some(gate) = gate {
                 let _ = gate.held.send(());
                 let _ = gate.wait.recv();
@@ -2464,10 +2475,16 @@ pub(crate) mod tests {
     /// one pane per page, in webtoon mode with `webtoon`; the receiver of
     /// its view jobs; its renderer.
     fn gated_reader(pages: &[usize], webtoon: bool) -> (App, Receiver<ViewEvent>, Arc<Gated>) {
+        gated_reader_within(pages, webtoon, Resident::BUDGET)
+    }
+
+    /// A `gated_reader` with an image budget of `budget` bytes.
+    fn gated_reader_within(pages: &[usize], webtoon: bool, budget: u64) -> (App, Receiver<ViewEvent>, Arc<Gated>) {
         let (events, _) = unbounded();
         let (view_events, views) = unbounded();
-        let resident = Arc::new(Resident::new(ImageIds::with_base(0x100), false));
-        let renderer = Arc::new(Gated { kitty: Kitty::new(CellSize::FALLBACK, false).with_slides(true), gate: std::sync::Mutex::new(None) });
+        let resident = Arc::new(Resident::new(ImageIds::with_base(0x100), false).with_budget(budget));
+        let kitty = Kitty::new(CellSize::FALLBACK, false).with_slides(true);
+        let renderer = Arc::new(Gated { kitty, gate: std::sync::Mutex::new(None), tops: std::sync::Mutex::new(Vec::new()) });
         let mut app = App::new(renderer.clone(), Terminal::default(), resident, Positions::load_from(None), events, view_events, (80, 24));
         (app.split, app.webtoon) = (pages.len() > 1, webtoon);
         for (i, &page) in pages.iter().enumerate() {
@@ -2478,24 +2495,44 @@ pub(crate) mod tests {
     }
 
     /// The kitty uploads and deletes in `bytes` in order, by image id: an
-    /// upload with whether it keeps the image without a placement, or `None`
-    /// for a delete that no upload of the id goes on with.
-    fn kitty_acts(bytes: &str) -> Vec<(u32, Option<bool>)> {
+    /// upload with whether it keeps the image without a placement and the
+    /// bytes the terminal stores for it, or `None` for a delete that no
+    /// upload of the id goes on with.
+    fn kitty_acts(bytes: &str) -> Vec<(u32, Option<(bool, u64)>)> {
         fn key<'a>(keys: &'a str, name: &str) -> Option<&'a str> {
             keys.split(',').find_map(|pair| pair.strip_prefix(name))
         }
-        let commands: Vec<&str> =
-            bytes.split("\x1b_G").skip(1).map(|command| &command[..command.find([';', '\x1b']).unwrap_or(command.len())]).collect();
+        let commands: Vec<(&str, &str)> = bytes
+            .split("\x1b_G")
+            .skip(1)
+            .map(|command| {
+                let command = &command[..command.find('\x1b').unwrap_or(command.len())];
+                command.split_once(';').unwrap_or((command, ""))
+            })
+            .collect();
         let upload = |keys: &str| matches!(key(keys, "a="), Some("t" | "T"));
+        // Raw pixels name their size; a PNG names it in its header.
+        let stored = |keys: &str, payload: &str| -> u64 {
+            let number = |name| key(keys, name).and_then(|n| n.parse::<u64>().ok());
+            match key(keys, "f=") {
+                Some("24") => 3 * number("s=").unwrap() * number("v=").unwrap(),
+                Some("32") => 4 * number("s=").unwrap() * number("v=").unwrap(),
+                _ => {
+                    let head = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &payload[..32]).unwrap();
+                    let side = |at: usize| u64::from(u32::from_be_bytes(head[at..at + 4].try_into().unwrap()));
+                    4 * side(16) * side(20)
+                }
+            }
+        };
         let mut acts = Vec::new();
-        for (n, &keys) in commands.iter().enumerate() {
+        for (n, &(keys, payload)) in commands.iter().enumerate() {
             let Some(id) = key(keys, "i=").and_then(|id| id.parse().ok()) else { continue };
             if upload(keys) {
-                acts.push((id, Some(key(keys, "a=") == Some("t"))));
+                acts.push((id, Some((key(keys, "a=") == Some("t"), stored(keys, payload)))));
             // Every upload starts with a delete of its id.
             } else if key(keys, "a=") == Some("d")
                 && key(keys, "d=") == Some("I")
-                && !commands.get(n + 1).is_some_and(|&next| upload(next) && key(next, "i=") == key(keys, "i="))
+                && !commands.get(n + 1).is_some_and(|&(next, _)| upload(next) && key(next, "i=") == key(keys, "i="))
             {
                 acts.push((id, None));
             }
@@ -2508,18 +2545,22 @@ pub(crate) mod tests {
     /// reaches the terminal before the frame that replaces it, an image that
     /// left the screen is deleted at most once after it, or replaced by the
     /// upload of a new image under its id, and after each frame the terminal
-    /// keeps only images that the frame draws or a lease holds.
+    /// keeps only images that the frame draws or a lease holds, in no more
+    /// bytes than the budget and the newest image.
     struct Screen {
         terminal: ratatui::Terminal<CrosstermBackend<Recorder>>,
         written: Recorder,
         /// The kitty ids the last frame drew.
         shown: BTreeSet<u32>,
-        /// The images the terminal keeps, by id, and whether each was kept
-        /// without a placement, as bands are.
-        images: BTreeMap<u32, bool>,
+        /// The images the terminal keeps, by id, with whether each was kept
+        /// without a placement, as bands are, and the bytes it takes.
+        images: BTreeMap<u32, (bool, u64)>,
         /// The images that left the screen and were not replaced, by id, and
         /// how often each was deleted since.
         left: BTreeMap<u32, usize>,
+        /// The reader's image budget, and the bytes of the newest upload.
+        budget: u64,
+        newest: u64,
     }
 
     impl Screen {
@@ -2527,7 +2568,8 @@ pub(crate) mod tests {
             let options = TerminalOptions { viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)) };
             let written = Recorder::default();
             let terminal = ratatui::Terminal::with_options(CrosstermBackend::new(written.clone()), options).unwrap();
-            Screen { terminal, written, shown: BTreeSet::new(), images: BTreeMap::new(), left: BTreeMap::new() }
+            let (shown, images, left) = (BTreeSet::new(), BTreeMap::new(), BTreeMap::new());
+            Screen { terminal, written, shown, images, left, budget: Resident::BUDGET, newest: 0 }
         }
 
         /// Writes a frame, as the event loop does after every event, and
@@ -2545,8 +2587,9 @@ pub(crate) mod tests {
             for (part, on_screen) in [(&out[..end], &self.shown), (&out[end..], &drawn)] {
                 for (id, upload) in kitty_acts(part) {
                     assert!(!on_screen.contains(&id), "image {id} changes on screen: {out:?}");
-                    if let Some(kept) = upload {
-                        self.images.insert(id, kept);
+                    if let Some((kept, bytes)) = upload {
+                        self.images.insert(id, (kept, bytes));
+                        self.newest = bytes;
                         self.left.remove(&id);
                     } else {
                         self.images.remove(&id);
@@ -2560,6 +2603,8 @@ pub(crate) mod tests {
             let idle = |id: &&u32| !drawn.contains(id) && !app.resident.leased(yoyomi_core::ImageId(**id));
             let idle: Vec<&u32> = self.images.keys().filter(idle).collect();
             assert!(idle.is_empty(), "the terminal keeps images nobody holds or shows: {idle:?}");
+            let held: u64 = self.images.values().map(|&(_, bytes)| bytes).sum();
+            assert!(held <= self.budget + self.newest, "the terminal holds {held} bytes: {:?}", self.images);
             self.shown = drawn;
         }
 
@@ -2610,7 +2655,7 @@ pub(crate) mod tests {
 
         /// The images the terminal keeps, bands or pages.
         fn kept(&self, bands: bool) -> usize {
-            self.images.values().filter(|&&kept| kept == bands).count()
+            self.images.values().filter(|&&(kept, _)| kept == bands).count()
         }
 
         /// Whether the image under `id` left the screen and the terminal.
@@ -2760,6 +2805,56 @@ pub(crate) mod tests {
         screen.settle(&mut app, &views);
         screen.finish(&mut app, &views);
         assert!(left.iter().chain(&right).all(|&id| screen.gone(id)), "{:?}", screen.left);
+    }
+
+    #[test]
+    fn a_theater_jump_past_the_budget_shows_the_band_in_view_and_then_the_one_around_it() {
+        // Bands of 624 x 336 pixels count 838,656 bytes, and the budget
+        // holds two and a half: the old view's two bands and the new view's
+        // two do not fit together.
+        let band = 4 * 624 * 336;
+        let (mut app, views, _renderer) = gated_reader_within(&[0], true, band * 5 / 2);
+        let mut screen = Screen::new();
+        screen.budget = band * 5 / 2;
+        screen.frame(&mut app);
+        screen.settle(&mut app, &views);
+        screen.press(&mut app, "T");
+        screen.settle(&mut app, &views);
+        screen.run(&mut app, &views, |_, screen| screen.kept(true) == 2 && screen.left.values().all(|&deletes| deletes == 1));
+        let old = on_screen(&app, 0);
+        let before = screen.written.text().len();
+        screen.press(&mut app, "G");
+        screen.settle(&mut app, &views);
+        screen.run(&mut app, &views, |_, screen| screen.kept(true) == 2 && screen.left.values().all(|&deletes| deletes == 1));
+        assert!(app.theater && on_screen(&app, 0) != old && old.iter().all(|&id| screen.gone(id)), "{:?}", screen.left);
+        let shown = on_screen(&app, 0);
+        let acts = kitty_acts(&screen.written.text()[before..]);
+        let deleted = acts.iter().position(|&(id, act)| old.contains(&id) && act.is_none()).expect("the old band leaves");
+        let around = acts.iter().position(|&(id, act)| !shown.contains(&id) && act.is_some()).expect("the band around the view comes");
+        assert!(deleted < around, "the band around the view waits for room: {acts:?}");
+    }
+
+    #[test]
+    fn a_page_the_budget_dropped_renders_again_when_turned_back_to() {
+        // Pages of 104 x 336 pixels count 139,776 bytes, and the budget
+        // holds two and a half.
+        let page = 4 * 104 * 336;
+        let (mut app, views, renderer) = gated_reader_within(&[0], false, page * 5 / 2);
+        let mut screen = Screen::new();
+        screen.budget = page * 5 / 2;
+        screen.frame(&mut app);
+        screen.run(&mut app, &views, |_, screen| screen.kept(false) == 2);
+        let first = on_screen(&app, 0);
+        // Page 3 renders ahead of page 2, and the budget takes page 1 away.
+        screen.press(&mut app, "j");
+        screen.run(&mut app, &views, |_, screen| screen.kept(false) == 2 && screen.left.values().all(|&deletes| deletes == 1));
+        assert!(first.iter().all(|&id| screen.gone(id)), "{:?}", screen.left);
+        screen.press(&mut app, "k");
+        screen.settle(&mut app, &views);
+        let again = on_screen(&app, 0);
+        assert_eq!(app.shown(0).map(|shown| shown.page), Some(0));
+        assert!(!again.is_empty() && again.iter().all(|id| screen.images.contains_key(id)), "page 1 shows from the terminal");
+        assert_eq!(renderer.tops.lock().unwrap().iter().filter(|&&top| top == 1).count(), 2, "page 1 rendered again");
     }
 
     #[test]

@@ -218,7 +218,10 @@ fn read(books: &[PathBuf], force: Option<RendererKind>) -> ExitCode {
     let probed = if needs_probe(force) { probe(force == Some(RendererKind::Sixel)) } else { Terminal::default() };
     let renderer = detect(&probed, force);
     let tmux = env::var_os("TMUX").is_some_and(|value| !value.is_empty());
-    let resident = Arc::new(Resident::new(ImageIds::for_process(), tmux));
+    let resident = Resident::new(ImageIds::for_process(), tmux);
+    // Where the app pins and deletes images, it keeps the terminal's image
+    // memory within the budget.
+    let resident = Arc::new(if renderer.slides() { resident.with_budget(Resident::BUDGET) } else { resident });
     let (events, received) = unbounded();
     let (view_events, view_received) = unbounded();
     let size = crossterm::terminal::size().unwrap_or((80, 24));
