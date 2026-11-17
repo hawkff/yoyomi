@@ -547,6 +547,17 @@ fn fill_scales_every_page_to_the_viewport_width() {
 }
 
 #[test]
+fn a_page_that_fill_would_enlarge_past_the_pixel_limit_reports_it() {
+    // 10 x 40,000 pixels at 1,000 wide would take 1,000 x 4,000,000.
+    let sixel = Recorder::new(RendererKind::Sixel, PIXEL);
+    let mut h = harness(Pages::new(vec![solid(10, 40_000, RED)]), sixel.clone(), false);
+    let shown = h.show(0, 0.0, StripRequest { fill: true, ..request(1000, 100) }).shown.expect("a frame");
+    assert_eq!(shown.errors.len(), 1, "{:?}", shown.errors);
+    assert!(shown.errors[0].starts_with("page 1: page exceeds"), "{:?}", shown.errors);
+    assert_eq!(pixel(&sixel.last(), 500, 50), CLEAR, "the page's place stays empty");
+}
+
+#[test]
 fn half_blocks_fill_the_viewport_width() {
     let half = Recorder::new(RendererKind::HalfBlock, CELL);
     let mut h = harness(Pages::new(vec![solid(40, 400, RED)]), half.clone(), false);

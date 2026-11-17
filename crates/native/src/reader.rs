@@ -193,6 +193,7 @@ impl Reader {
                 // Page mode goes on from the page at the top of the strip.
                 self.state.page = self.at().page;
                 self.state.webtoon = !webtoon;
+                self.state.theater = false;
                 self.state.spread = false;
                 self.state.offset = 0.0;
                 self.reset_view();
