@@ -339,7 +339,7 @@ default openers in the "open with" menu, write `use = ["yy", "open"]`.
 | `g` / `G` | first / last page (`42G` goes to page 42) |
 | `z` | focus mode: hide the titles and the status bar |
 | `t` | webtoon mode: one continuous strip with eased scrolling (single pane); wide pages shrink to fit, narrow pages keep their size |
-| `T` | theater mode: each page fills the pane's width and shows one part at a time; `j` / `k` step through the parts, then turn the page |
+| `T` | theater mode: webtoon mode with every page as wide as the pane (single pane) |
 | `s` | two-page spread (single pane) |
 | `w` | switch pane |
 | `v` | split or unsplit, keeping the active pane |
@@ -402,17 +402,11 @@ Konsole) or the window manager's, then press `z` to hide the titles and the
 status bar. In the browser reader, `F11` does the same.
 
 On a wide screen a portrait page takes a narrow column. `T` turns on theater
-mode, where every page grows to the width of its pane and keeps its
-proportions. A page taller than the pane then shows in parts, one screen
-each. yoyomi spreads the parts evenly from the top of the page to its bottom
-and lets them overlap, so a page 2.3 screens tall takes three parts. `j`,
-`J` and the mouse wheel show the next part and turn the page after the last
-one. `k` and `K` go back, and from the top of a page they show the bottom of
-the one before. yoyomi renders the next part ahead of the key, as it does the
-next page, and a step draws one frame without scrolling. `g`, `G` and `0`
-show a page from its top. Theater mode works in a split. In theater mode
-`+`, `-`, `s`, text selection and links are off, and `Q` saves the page but
-not the mode.
+mode, which is webtoon mode with every page scaled to the width of the pane
+by one factor for both axes. `j` and `k` move one screen, `J` and `K` half a
+screen. `t` switches to webtoon mode in the same place, with each page at
+its own width, and `T` switches back. `Q` saves the mode with the position,
+and `f` takes it to the macOS window.
 
 ## Mouse
 
