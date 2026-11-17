@@ -18,8 +18,9 @@ pub enum Layer {
     KittyRows { id: ImageId, cols: u16, src_row: u16, rows: u16, at: At },
     /// `height` pixel rows of kitty image `id` from its row `top`, `width`
     /// pixels wide, shown from `offset` pixels below the top of the cell
-    /// `at` through a placement of the image the terminal keeps.
-    KittySlice { id: ImageId, width: u32, top: u32, height: u32, at: At, offset: u32 },
+    /// `at` and `left` pixels right of its left edge through a placement of
+    /// the image the terminal keeps.
+    KittySlice { id: ImageId, left: u32, width: u32, top: u32, height: u32, at: At, offset: u32 },
     /// A sixel image. The app draws it after the cells flush and leaves the
     /// cells under it untouched.
     Sixel { data: Arc<[u8]>, grid: Grid, at: At },

@@ -122,12 +122,22 @@ struct View {
     origin: f64,
     band_rows: i64,
     bands: HashMap<i64, Band>,
+    /// Whether the last move went up: the bands above are then the ones the
+    /// next move reaches first.
+    upward: bool,
+    /// Whether the last band kept was opaque. The next one likely is too,
+    /// and the terminal stores three bytes a pixel of it, not four.
+    opaque: bool,
+    /// Whether each band kept so far was opaque, by index.
+    opacity: HashMap<i64, bool>,
 }
 
-/// A kitty band: `band_rows` terminal rows of the strip as one image.
+/// A kitty band: `band_rows` terminal rows of the strip as one image, which
+/// covers the viewport's columns `span`, as pixels from its left edge and a
+/// width.
 enum Band {
     Rendering { lease: Lease, cancel: Cancel },
-    Ready { lease: Lease, frame: Frame, errors: Vec<String> },
+    Ready { lease: Lease, frame: Frame, errors: Vec<String>, span: (u32, u32) },
     Failed(String),
 }
 
@@ -145,12 +155,22 @@ impl Band {
     }
 }
 
+/// The bytes the terminal stores for a band of `width` by `height` pixels:
+/// three a pixel when `opaque`, as `Renderer::keep` sends it.
+fn band_bytes(width: u32, height: u32, opaque: bool) -> u64 {
+    (if opaque { 3 } else { 4 }) * u64::from(width) * u64::from(height)
+}
+
 /// A finished job of the strip.
 enum Done {
     Size { page: usize, result: Result<(u32, u32)> },
-    Band { generation: u64, index: i64, lease: Lease, result: Result<(Frame, Vec<String>)> },
-    Frame { generation: u64, job: u64, page: usize, result: Result<(Frame, Vec<String>)> },
+    Band { generation: u64, index: i64, lease: Lease, span: (u32, u32), result: Result<Composed> },
+    Frame { generation: u64, job: u64, page: usize, result: Result<Composed> },
 }
+
+/// What a job composed: the frame, the pages that failed, and whether an
+/// image kept in the terminal is opaque.
+type Composed = (Frame, Vec<String>, bool);
 
 impl Strip {
     /// A strip for `book`. Its jobs run on `jobs` and report through
@@ -252,6 +272,9 @@ impl Strip {
             frame_job: 0,
             origin: 0.0,
             bands: HashMap::new(),
+            upward: false,
+            opaque: false,
+            opacity: HashMap::new(),
         };
         view.clamp(&mut self.cx);
         view.origin = view.top;
@@ -385,6 +408,7 @@ impl Strip {
         if (view.top - before).abs() < 1e-9 {
             return Update::default();
         }
+        view.upward = view.top < before;
         if view.placeholders() {
             view.align(&self.cx.resident);
         }
@@ -413,6 +437,16 @@ impl Strip {
         let left = f64::from(view.width.saturating_sub(placed.width) / 2);
         let (fx, fy) = ((x - left) / f64::from(placed.width), (y - placed.top as f64) / f64::from(placed.height));
         ((0.0..1.0).contains(&fx) && (0.0..1.0).contains(&fy)).then_some((placed.page, fx, fy))
+    }
+
+    /// Starts the bands around the viewport that waited for room in the
+    /// image budget, as after images left the terminal.
+    pub fn room_freed(&mut self) {
+        if let Some(view) = &mut self.view
+            && view.kitty
+        {
+            view.request_bands(&mut self.cx);
+        }
     }
 
     /// Takes a finished job of this strip, or hands back an event it did not
@@ -595,10 +629,29 @@ impl View {
             }
             keep
         });
-        for index in wanted {
+        // The visible bands, then the ones ahead of the last move, which the
+        // next one reaches first, then the ones behind.
+        let (below, above) = (visible.end() + 1..wanted.end() + 1, *wanted.start()..*visible.start());
+        let (ahead, behind) = if self.upward { (above, below) } else { (below, above) };
+        let mut waiting = 0;
+        for index in visible.clone().chain(ahead) {
             if !self.bands.contains_key(&index) && self.covers_band(index) {
                 let priority = if visible.contains(&index) { Priority::Visible } else { Priority::Neighbor };
-                self.render_band(cx, index, priority);
+                waiting += self.render_band(cx, index, priority).unwrap_or(0);
+            }
+        }
+        // A band ahead waits for room in the image budget. Unless the images
+        // about to leave the terminal make it, the band behind gives its
+        // room up: a move the other way then waits for a band once, where a
+        // move on would wait at every band.
+        let short = waiting > 0 && !cx.resident.room_to_come(waiting);
+        for index in behind {
+            if short {
+                if let Some(band) = self.bands.remove(&index) {
+                    band.release(&cx.resident);
+                }
+            } else if !self.bands.contains_key(&index) && self.covers_band(index) {
+                self.render_band(cx, index, Priority::Neighbor);
             }
         }
     }
@@ -648,19 +701,38 @@ impl View {
         (start(index), (start(index + 1) - start(index)) as u32)
     }
 
-    /// Starts rendering band `index`, unless no page reaches into it.
-    fn render_band(&mut self, cx: &Context, index: i64, priority: Priority) {
+    /// Starts rendering band `index`, unless no page reaches into it or, for
+    /// a band around the viewport, the image budget has no room for it:
+    /// then it returns the bytes the band needs. Where the strip slides, a
+    /// band reaches from the leftmost pixel of its pages to the rightmost.
+    fn render_band(&mut self, cx: &Context, index: i64, priority: Priority) -> Option<u64> {
         let (y, height) = self.band_span(index);
-        let pieces = self.pieces(&cx.book, y, height);
-        if pieces.is_empty() {
-            return;
+        let mut pieces = self.pieces(&cx.book, y, height);
+        let (mut left, mut width) = (0, self.width);
+        if self.slides
+            && let Some(from) = pieces.iter().map(|piece| piece.x).min()
+        {
+            let to = pieces.iter().map(|piece| piece.x + piece.key.width).max().unwrap_or(from).min(self.width);
+            (left, width) = (from, to - from);
+            for piece in &mut pieces {
+                piece.x -= left;
+            }
         }
-        let lease = cx.resident.lease();
+        if pieces.is_empty() {
+            return None;
+        }
+        let bytes = band_bytes(width, height, self.opacity.get(&index).copied().unwrap_or(self.opaque));
+        if priority == Priority::Neighbor && !cx.resident.room(bytes) {
+            return Some(bytes);
+        }
+        let lease = cx.resident.lease(bytes);
         let cancel = Cancel::new();
         let generation = self.generation;
         let grid = (!self.slides).then(|| Grid::new(self.cols, self.band_rows as u16));
-        cx.render(priority, &cancel, pieces, (self.width, height), lease.id, grid, move |result| Done::Band { generation, index, lease, result });
+        let done = move |result| Done::Band { generation, index, lease, span: (left, width), result };
+        cx.render(priority, &cancel, pieces, (width, height), lease.id, grid, done);
         self.bands.insert(index, Band::Rendering { lease, cancel });
+        None
     }
 
     /// Whether every visible band that holds pages is ready or failed.
@@ -680,12 +752,12 @@ impl View {
         let (mut layers, mut errors) = (Vec::new(), Vec::new());
         for index in self.band_ranges().0 {
             match self.bands.get(&index) {
-                Some(Band::Ready { lease, errors: failed, .. }) if self.slides => {
-                    layers.extend(self.slice(index, lease.id));
+                Some(Band::Ready { lease, errors: failed, span, .. }) if self.slides => {
+                    layers.extend(self.slice(index, lease.id, *span));
                     cx.resident.touch(*lease);
                     errors.extend(failed.iter().cloned());
                 }
-                Some(Band::Ready { lease, frame, errors: failed }) => {
+                Some(Band::Ready { lease, frame, errors: failed, .. }) => {
                     // Placeholder rows past the grid the renderer returned
                     // would point outside the image.
                     let grid = frame.grid();
@@ -712,17 +784,18 @@ impl View {
         Shown { page: self.position().page, scene: Scene { layers }, errors }
     }
 
-    /// The rows of band `index`, kept as image `id`, that the viewport
-    /// shows, as a slice from the cell where they start; none when the band
-    /// lies outside the viewport.
-    fn slice(&self, index: i64, id: ImageId) -> Option<Layer> {
+    /// The rows of band `index`, kept as image `id` and covering the
+    /// viewport's columns `span`, as pixels from its left edge and a width,
+    /// that the viewport shows, as a slice from the cell where they start;
+    /// none when the band lies outside the viewport.
+    fn slice(&self, index: i64, id: ImageId, (left, width): (u32, u32)) -> Option<Layer> {
         let top = self.top.round() as i64;
         let (start, height) = self.band_span(index);
         let from = top.max(start);
         let to = (top + i64::from(self.height)).min(start + i64::from(height));
         (to > from).then(|| {
             let (row, offset) = self.cell_at(from - top);
-            Layer::KittySlice { id, width: self.width, top: (from - start) as u32, height: (to - from) as u32, at: At { col: 0, row }, offset }
+            Layer::KittySlice { id, left, width, top: (from - start) as u32, height: (to - from) as u32, at: At { col: 0, row }, offset }
         })
     }
 
@@ -802,18 +875,45 @@ impl View {
         let mut update = Update::default();
         match done {
             Done::Size { .. } => return self.sized(cx),
-            Done::Band { generation, index, lease, result } => {
+            Done::Band { generation, index, lease, span, result } => {
                 let current = matches!(self.bands.get(&index), Some(Band::Rendering { lease: running, .. }) if *running == lease);
                 if generation != self.generation || !current {
                     return update;
                 }
                 let band = match result {
-                    Ok((frame, errors)) => {
+                    // The budget took the id while the band rendered; its
+                    // upload would replace another image.
+                    Ok(_) if !cx.resident.holds(lease) => {
+                        self.bands.remove(&index);
+                        if self.waiting {
+                            self.request_bands(cx);
+                            if self.bands_ready() {
+                                update.shown = Some(self.band_scene(cx, &mut update.uploads));
+                            }
+                        }
+                        return update;
+                    }
+                    Ok((frame, errors, opaque)) => {
+                        if self.slides {
+                            let (_, height) = self.band_span(index);
+                            cx.resident.resize(lease, band_bytes(span.1, height, opaque));
+                            self.opaque = opaque;
+                            self.opacity.insert(index, opaque);
+                            // A band around the viewport that counts more
+                            // than it was leased for and passes the budget
+                            // gives its room back unsent. From now on it is
+                            // leased for what it counts.
+                            if !self.band_ranges().0.contains(&index) && !cx.resident.room_to_come(0) {
+                                cx.resident.release(lease);
+                                self.bands.remove(&index);
+                                return update;
+                            }
+                        }
                         // Under tmux a band goes out with the frames that draw it.
                         if !cx.resident.resend() {
                             update.uploads.extend(Upload::from_frame(&frame));
                         }
-                        Band::Ready { lease, frame, errors }
+                        Band::Ready { lease, frame, errors, span }
                     }
                     Err(error) => {
                         cx.resident.release(lease);
@@ -821,6 +921,11 @@ impl View {
                     }
                 };
                 self.bands.insert(index, band);
+                // A band that counts less than it was leased for leaves room
+                // for one that waited.
+                if self.slides {
+                    self.request_bands(cx);
+                }
                 if self.waiting && self.bands_ready() {
                     update.shown = Some(self.band_scene(cx, &mut update.uploads));
                 }
@@ -833,7 +938,7 @@ impl View {
                 self.frame = None;
                 self.waiting = false;
                 update.shown = Some(match result {
-                    Ok((frame, errors)) => Shown { page, scene: Scene { layers: vec![Layer::from_frame(&frame, At::default())] }, errors },
+                    Ok((frame, errors, _)) => Shown { page, scene: Scene { layers: vec![Layer::from_frame(&frame, At::default())] }, errors },
                     Err(error) => Shown { page, scene: Scene::default(), errors: vec![error.to_string()] },
                 });
             }
@@ -875,7 +980,7 @@ impl Context {
         (width, height): (u32, u32),
         id: ImageId,
         grid: Option<Grid>,
-        done: impl FnOnce(Result<(Frame, Vec<String>)>) -> Done + Send + 'static,
+        done: impl FnOnce(Result<Composed>) -> Done + Send + 'static,
     ) {
         let (book, scaled, renderer, events, source) =
             (self.book.clone(), self.scaled.clone(), self.renderer.clone(), self.events.clone(), self.source);
@@ -883,11 +988,10 @@ impl Context {
         let refuse_text = renderer.kind() == RendererKind::HalfBlock;
         self.jobs.spawn(priority, cancel, move || {
             let result = compose(&book, &scaled, &pieces, (width, height), refuse_text, &job_cancel).and_then(|(image, errors)| {
-                let frame = match grid {
-                    Some(grid) => renderer.render(&image, id, grid, false)?,
-                    None => renderer.keep(&image, id)?,
-                };
-                Ok((frame, errors))
+                Ok(match grid {
+                    Some(grid) => (renderer.render(&image, id, grid, false)?, errors, false),
+                    None => (renderer.keep(&image, id)?, errors, image.pixels().all(|pixel| pixel[3] == 255)),
+                })
             });
             // The app may have dropped the receiver while it shuts down.
             let _ = events.send(ViewEvent::new(source, done(result)));

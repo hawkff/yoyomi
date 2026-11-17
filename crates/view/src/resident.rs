@@ -19,9 +19,18 @@ pub struct Lease {
 /// The ids that frames on screen draw are pinned: no lease takes them, and
 /// once given back they leave through `take_freed` only after the frames
 /// that replace them show.
+///
+/// With a budget, the same rule holds for the bytes the terminal stores:
+/// once a frame, `take_freed` takes the least recently shown leases away
+/// until the images fit it. Pinned images, the newest lease and leases taken
+/// since the last `pin` are never taken. An image readied ahead of any
+/// frame is leased only when it fits (`room`, `lease_ahead`), so only the
+/// images the frames on screen and the frames being readied draw can keep
+/// the terminal past the budget.
 pub struct Resident {
     ids: ImageIds,
     resend: bool,
+    budget: Option<u64>,
     state: Mutex<State>,
 }
 
@@ -34,15 +43,49 @@ struct State {
     /// Ids whose lease ended, until `take_freed` returns them or a lease
     /// takes them again.
     freed: BTreeSet<ImageId>,
+    /// The bytes the terminal stores for each id leased or freed.
+    bytes: HashMap<ImageId, u64>,
+    /// The generation of the last lease before the last `pin`.
+    pinned_at: u64,
+}
+
+impl State {
+    /// The bytes of the images the terminal holds.
+    fn held(&self) -> u64 {
+        self.bytes.values().sum()
+    }
+
+    /// The bytes of the images the terminal still holds once `take_freed`
+    /// returned the ids it may.
+    fn staying(&self) -> u64 {
+        let leaving = |id: &ImageId| self.freed.contains(id) && !self.pinned.contains(id) && !self.leases.contains_key(id);
+        self.bytes.iter().filter(|(id, _)| !leaving(id)).map(|(_, bytes)| bytes).sum()
+    }
+
+    /// Whether the budget may take the lease of `id` away: not one a frame
+    /// on screen draws, not the newest, and not one taken since the last
+    /// `pin`, which a frame being readied may draw.
+    fn may_go(&self, id: &ImageId) -> bool {
+        !self.pinned.contains(id) && self.leases[id] <= self.pinned_at && self.leases[id] != self.generation
+    }
 }
 
 impl Resident {
+    /// The image memory the reader keeps to where it pins and deletes: well
+    /// under what some terminals hold before they drop images.
+    pub const BUDGET: u64 = 64 << 20;
+
     /// A registry over `ids`. With `resend`, as under tmux, an upload goes out
     /// only with a frame that draws its image, and again whenever a frame
     /// draws the image anew, because tmux drops passthrough that arrives while
     /// it redraws.
     pub fn new(ids: ImageIds, resend: bool) -> Self {
-        Resident { ids, resend, state: Mutex::new(State::default()) }
+        Resident { ids, resend, budget: None, state: Mutex::new(State::default()) }
+    }
+
+    /// The registry that keeps the images in the terminal within `bytes`.
+    pub fn with_budget(self, bytes: u64) -> Self {
+        Resident { budget: Some(bytes), ..self }
     }
 
     /// Whether uploads go out with the frames that draw their images.
@@ -50,10 +93,27 @@ impl Resident {
         self.resend
     }
 
-    /// Claims an id that is not pinned: a free one, or else the least
-    /// recently shown.
-    pub fn lease(&self) -> Lease {
+    /// Claims an id that is not pinned, for an image the terminal stores in
+    /// `bytes`: a free one, or else the least recently shown.
+    pub fn lease(&self, bytes: u64) -> Lease {
+        self.lease_in(&mut self.state.lock(), bytes)
+    }
+
+    /// Claims an id as `lease` does, for an image readied ahead of any
+    /// frame, such as the next page: only when it fits the budget once the
+    /// leases that may go went, which `take_freed` then takes away.
+    pub fn lease_ahead(&self, bytes: u64) -> Option<Lease> {
         let mut state = self.state.lock();
+        if let Some(budget) = self.budget {
+            let going: u64 = state.leases.keys().filter(|id| state.may_go(id)).map(|id| state.bytes[id]).sum();
+            if state.staying() - going + bytes > budget {
+                return None;
+            }
+        }
+        Some(self.lease_in(&mut state, bytes))
+    }
+
+    fn lease_in(&self, state: &mut State, bytes: u64) -> Lease {
         let id = match self.take_unpinned(&state.pinned) {
             Some(id) => id,
             None => match state.order.iter().position(|id| !state.pinned.contains(id)) {
@@ -72,7 +132,34 @@ impl Resident {
         state.leases.insert(id, generation);
         state.order.retain(|&held| held != id);
         state.order.push_back(id);
+        state.bytes.insert(id, bytes);
         Lease { id, generation }
+    }
+
+    /// Takes leases away, least recently shown first, until what the
+    /// terminal keeps once `take_freed` returns fits `budget`.
+    fn make_room(&self, state: &mut State, budget: u64) {
+        let mut held = state.staying();
+        while held > budget {
+            let Some(oldest) = state.order.iter().position(|id| state.may_go(id)) else { break };
+            let id = state.order.remove(oldest).expect("the position is in the order");
+            state.leases.remove(&id);
+            state.freed.insert(id);
+            self.ids.give_back(id);
+            held -= state.bytes[&id];
+        }
+    }
+
+    /// Whether an image of `bytes` fits the budget beside the images the
+    /// terminal holds now, without taking any away.
+    pub fn room(&self, bytes: u64) -> bool {
+        self.budget.is_none_or(|budget| self.state.lock().held() + bytes <= budget)
+    }
+
+    /// Whether an image of `bytes` fits the budget once the images whose
+    /// ids `take_freed` returns next left the terminal.
+    pub fn room_to_come(&self, bytes: u64) -> bool {
+        self.budget.is_none_or(|budget| self.state.lock().staying() + bytes <= budget)
     }
 
     /// A free id that is not pinned. The pinned ones it meets go back to the
@@ -94,23 +181,29 @@ impl Resident {
     /// Pins `ids`, the ones frames on screen draw, in place of those pinned
     /// before.
     pub fn pin(&self, ids: impl IntoIterator<Item = ImageId>) {
-        self.state.lock().pinned = ids.into_iter().collect();
+        let mut state = self.state.lock();
+        state.pinned = ids.into_iter().collect();
+        state.pinned_at = state.generation;
     }
 
     /// The ids given back since the last call that are neither pinned nor
     /// leased again: no frame on screen draws their images and nobody holds
     /// them. Each comes once; pinned ones wait for a later call, and ones
     /// leased again are dropped, because their next upload replaces the
-    /// image.
+    /// image. Past the budget, the leases that may go are taken first.
     pub fn take_freed(&self) -> Vec<ImageId> {
         let mut state = self.state.lock();
-        let State { leases, pinned, freed, .. } = &mut *state;
+        if let Some(budget) = self.budget {
+            self.make_room(&mut state, budget);
+        }
+        let State { leases, pinned, freed, bytes, .. } = &mut *state;
         let mut taken = Vec::new();
         freed.retain(|id| match (leases.contains_key(id), pinned.contains(id)) {
             (true, _) => false,
             (false, pinned) => {
                 if !pinned {
                     taken.push(*id);
+                    bytes.remove(id);
                 }
                 pinned
             }
@@ -126,6 +219,15 @@ impl Resident {
     /// Whether a lease holds `id`.
     pub fn leased(&self, id: ImageId) -> bool {
         self.state.lock().leases.contains_key(&id)
+    }
+
+    /// Counts `bytes` for the image of `lease`, once the terminal is known
+    /// to store another size than the lease was taken for.
+    pub fn resize(&self, lease: Lease, bytes: u64) {
+        let mut state = self.state.lock();
+        if state.leases.get(&lease.id) == Some(&lease.generation) {
+            state.bytes.insert(lease.id, bytes);
+        }
     }
 
     /// Marks the image of `lease` as shown now, so it goes last.
@@ -161,9 +263,9 @@ mod tests {
     #[test]
     fn the_least_recently_shown_image_goes_first() {
         let resident = Resident::new(ImageIds::with_base(0x100), false);
-        let leases: Vec<Lease> = (0..ImageIds::PER_PROCESS).map(|_| resident.lease()).collect();
+        let leases: Vec<Lease> = (0..ImageIds::PER_PROCESS).map(|_| resident.lease(0)).collect();
         resident.touch(leases[0]);
-        let next = resident.lease();
+        let next = resident.lease(0);
         assert_eq!(next.id, leases[1].id, "the second lease was the least recently shown");
         assert!(!resident.holds(leases[1]));
         assert!(resident.holds(leases[0]) && resident.holds(next));
@@ -172,10 +274,10 @@ mod tests {
     #[test]
     fn released_ids_return_to_the_pool() {
         let resident = Resident::new(ImageIds::with_base(0x100), true);
-        let lease = resident.lease();
+        let lease = resident.lease(0);
         resident.release(lease);
         assert!(!resident.holds(lease));
-        let again = resident.lease();
+        let again = resident.lease(0);
         assert_eq!(again.id, lease.id);
         assert_ne!(again, lease, "a new lease on the same id is a different claim");
         assert!(resident.resend());
@@ -184,33 +286,33 @@ mod tests {
     #[test]
     fn a_pinned_id_is_neither_handed_out_nor_taken_from_its_lease() {
         let resident = Resident::new(ImageIds::with_base(0x100), false);
-        let (shown, kept) = (resident.lease(), resident.lease());
+        let (shown, kept) = (resident.lease(0), resident.lease(0));
         resident.pin([shown.id, kept.id]);
         resident.release(shown);
-        let next = resident.lease();
+        let next = resident.lease(0);
         assert!(next.id != shown.id && next.id != kept.id, "{next:?} is pinned");
         // With the pool empty, the least recently shown lease that is not
         // pinned goes: not `kept`, the oldest.
-        let rest: Vec<Lease> = (0..ImageIds::PER_PROCESS - 3).map(|_| resident.lease()).collect();
-        let taken = resident.lease();
+        let rest: Vec<Lease> = (0..ImageIds::PER_PROCESS - 3).map(|_| resident.lease(0)).collect();
+        let taken = resident.lease(0);
         assert_eq!(taken.id, next.id, "the oldest lease not pinned");
         assert!(resident.holds(kept) && !resident.holds(next) && rest.iter().all(|&lease| resident.holds(lease)));
         // Once unpinned, the id given back is free again.
         resident.pin([]);
-        assert_eq!(resident.lease().id, shown.id);
+        assert_eq!(resident.lease(0).id, shown.id);
     }
 
     #[test]
     fn freed_ids_wait_for_their_pins_and_come_once() {
         let resident = Resident::new(ImageIds::with_base(0x100), false);
-        let (shown, reused, gone) = (resident.lease(), resident.lease(), resident.lease());
+        let (shown, reused, gone) = (resident.lease(0), resident.lease(0), resident.lease(0));
         resident.pin([shown.id]);
         for lease in [shown, reused, gone] {
             resident.release(lease);
         }
         // The lowest free id that is not pinned goes to a new lease, whose
         // next upload replaces the image.
-        let renewed = resident.lease();
+        let renewed = resident.lease(0);
         assert_eq!(renewed.id, reused.id);
         assert_eq!(resident.take_freed(), [gone.id], "the pinned id waits and the leased one is dropped");
         assert!(resident.take_freed().is_empty(), "each id comes once");
@@ -224,23 +326,95 @@ mod tests {
     #[test]
     fn the_least_recently_shown_rule_holds_among_unpinned_ids() {
         let resident = Resident::new(ImageIds::with_base(0x100), false);
-        let leases: Vec<Lease> = (0..ImageIds::PER_PROCESS).map(|_| resident.lease()).collect();
+        let leases: Vec<Lease> = (0..ImageIds::PER_PROCESS).map(|_| resident.lease(0)).collect();
         resident.pin([leases[0].id, leases[1].id]);
         resident.touch(leases[2]);
-        let next = resident.lease();
+        let next = resident.lease(0);
         assert_eq!(next.id, leases[3].id, "0 and 1 are pinned and 2 was shown last");
         assert!(resident.take_freed().is_empty(), "an id taken from its lease goes straight to the new one");
     }
 
     #[test]
+    fn past_the_budget_the_least_recently_shown_lease_that_may_go_goes() {
+        let resident = Resident::new(ImageIds::with_base(0x100), false).with_budget(100);
+        let held = || resident.state.lock().held();
+        let (a, b, c) = (resident.lease(40), resident.lease(40), resident.lease(10));
+        assert!(resident.room(10) && !resident.room(11));
+        // A frame shows b; a was shown before c.
+        resident.pin([b.id]);
+        resident.touch(c);
+        let d = resident.lease(30);
+        assert!(resident.holds(a) && !resident.room(0), "leases go once a frame");
+        assert_eq!(resident.take_freed(), [a.id]);
+        assert!(!resident.holds(a) && [b, c, d].iter().all(|&lease| resident.holds(lease)), "a went, not the pinned b");
+        assert_eq!(held(), 80);
+
+        // The newest lease stays, also alone past the budget, and so does d,
+        // leased since the pin for a frame to come.
+        let big = resident.lease(500);
+        assert_eq!(resident.take_freed(), [c.id]);
+        assert!(!resident.holds(c) && [b, d, big].iter().all(|&lease| resident.holds(lease)));
+        assert_eq!(held(), 570);
+        resident.pin([big.id]);
+        let small = resident.lease(10);
+        let mut freed = resident.take_freed();
+        assert!(!resident.holds(b) && !resident.holds(d) && resident.holds(big) && resident.holds(small));
+        freed.sort();
+        assert_eq!((freed, held()), (vec![b.id, d.id], 510));
+
+        // An id leased again counts its new image only.
+        let resident = Resident::new(ImageIds::with_base(0x100), false).with_budget(100);
+        let first = resident.lease(60);
+        resident.release(first);
+        let again = resident.lease(30);
+        assert_eq!((again.id, resident.state.lock().held()), (first.id, 30));
+        assert!(resident.take_freed().is_empty());
+    }
+
+    #[test]
+    fn a_lease_counts_the_bytes_it_was_resized_to() {
+        let resident = Resident::new(ImageIds::with_base(0x100), false).with_budget(10);
+        let (kept, gone) = (resident.lease(8), resident.lease(1));
+        assert!(!resident.room(2));
+        resident.resize(kept, 6);
+        assert!(resident.room(3) && !resident.room(4));
+        // A lease that ended keeps what it counted until its image leaves.
+        resident.release(gone);
+        resident.resize(gone, 0);
+        assert!(!resident.room(4) && resident.room_to_come(4) && !resident.room_to_come(5));
+        resident.pin([gone.id]);
+        assert!(!resident.room_to_come(4), "an image on screen stays");
+    }
+
+    #[test]
+    fn an_image_ahead_is_leased_when_it_fits_once_the_leases_that_may_go_went() {
+        let resident = Resident::new(ImageIds::with_base(0x100), false).with_budget(100);
+        let (old, shown) = (resident.lease(40), resident.lease(40));
+        assert!(resident.lease_ahead(30).is_none(), "leases taken since the last pin stay");
+        resident.pin([shown.id]);
+        let next = resident.lease_ahead(60).expect("the old lease makes room");
+        assert!(resident.lease_ahead(1).is_none(), "the image on screen and the one ahead fill the budget");
+        assert_eq!(resident.take_freed(), [old.id]);
+        assert!(resident.holds(shown) && resident.holds(next) && !resident.holds(old));
+    }
+
+    #[test]
+    fn without_a_budget_nothing_goes_early() {
+        let resident = Resident::new(ImageIds::with_base(0x100), false);
+        let leases: Vec<Lease> = (0..4).map(|_| resident.lease(u64::MAX / 8)).collect();
+        assert!(leases.iter().all(|&lease| resident.holds(lease)) && resident.room(u64::MAX / 8));
+        assert!(resident.lease_ahead(u64::MAX / 8).is_some());
+    }
+
+    #[test]
     fn with_every_id_pinned_a_lease_still_comes() {
         let resident = Resident::new(ImageIds::with_base(0x100), false);
-        let leases: Vec<Lease> = (0..ImageIds::PER_PROCESS).map(|_| resident.lease()).collect();
+        let leases: Vec<Lease> = (0..ImageIds::PER_PROCESS).map(|_| resident.lease(0)).collect();
         resident.pin(resident.ids());
-        let taken = resident.lease();
+        let taken = resident.lease(0);
         assert_eq!(taken.id, leases[0].id, "the least recently shown");
         // Some ids given back and every one pinned: the pool hands one out.
         resident.release(leases[1]);
-        assert_eq!(resident.lease().id, leases[1].id);
+        assert_eq!(resident.lease(0).id, leases[1].id);
     }
 }

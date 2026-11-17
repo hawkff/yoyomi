@@ -202,8 +202,12 @@ struct Harness {
 }
 
 fn harness(book: Arc<Pages>, renderer: Arc<dyn Renderer>, resend: bool) -> Harness {
+    harness_on(book, renderer, Resident::new(ImageIds::with_base(0x100), resend))
+}
+
+fn harness_on(book: Arc<Pages>, renderer: Arc<dyn Renderer>, resident: Resident) -> Harness {
     let (sender, events) = unbounded();
-    let resident = Arc::new(Resident::new(ImageIds::with_base(0x100), resend));
+    let resident = Arc::new(resident);
     let strip = Strip::new(Arc::new(PageCache::new(book)), renderer, Jobs::new(2), resident.clone(), sender);
     Harness { strip, events, resident }
 }
@@ -507,11 +511,11 @@ fn assert_slices_tile_the_viewport(h: &Harness, kitty: &Recorder, update: &Updat
     let (top, cell_top) = (view.top.round() as i64, |row: u16| (f64::from(row) * view.cell_h).round() as i64);
     let mut y = 0;
     for layer in &shown.scene.layers {
-        let Layer::KittySlice { id, width, top: from, height, at, offset } = *layer else { panic!("not a slice: {layer:?}") };
-        assert_eq!((width, at.col), (view.width, 0), "{layer:?}");
+        let Layer::KittySlice { id, left, width, top: from, height, at, offset } = *layer else { panic!("not a slice: {layer:?}") };
+        let band = kitty.image(id);
+        assert_eq!((left, width, at.col), ((view.width - band.width()) / 2, band.width(), 0), "{layer:?} covers the page");
         assert!(at.row < view.rows && f64::from(offset) < view.cell_h.ceil(), "{layer:?}");
         assert_eq!(cell_top(at.row) + i64::from(offset), y, "{layer:?} starts where the slice above ends");
-        let band = kitty.image(id);
         assert!(height > 0 && from + height <= band.height(), "{layer:?} inside a band of {} rows", band.height());
         for row in 0..height {
             let [_, high, low, _] = pixel(&band, band.width() / 2, from + row);
@@ -552,6 +556,38 @@ fn sliding_slices_cover_the_viewport_at_any_pixel() {
 }
 
 #[test]
+fn sliding_bands_reach_only_as_far_as_their_pages() {
+    for cell in [CELL, CellSize { w: 7.3, h: 15.6 }] {
+        // Ten columns of 80 or 73 pixels; band 0 holds pages of 30 and 50
+        // pixels, band 2 one page of 30.
+        let kitty = Recorder::sliding(cell);
+        let pages = vec![rows_page(0, 30, 100), rows_page(1, 50, 100), rows_page(2, 30, 400)];
+        let mut h = harness(Pages::new(pages), kitty.clone(), false);
+        let shown = h.show(0, 0.0, request(10, 10)).shown.expect("a frame");
+        let width = h.view().width;
+        let [Layer::KittySlice { id, left, width: 50, .. }] = shown.scene.layers[..] else { panic!("{:?}", shown.scene.layers) };
+        assert_eq!(left, (width - 50) / 2, "the slice starts at the wider page");
+        let band = kitty.image(id);
+        let narrow = (width - 30) / 2 - left;
+        assert_eq!(band.width(), 50);
+        assert_eq!((pixel(&band, narrow, 0), pixel(&band, narrow + 29, 99)), ([0, 0, 0, 255], [0, 99, 0, 255]));
+        assert_eq!((pixel(&band, narrow - 1, 0), pixel(&band, narrow + 30, 0)), (CLEAR, CLEAR), "the narrower page leaves clear margins");
+        assert_eq!(pixel(&band, 0, 100), [1, 0, 0, 255]);
+        h.strip.shift(25.0);
+        h.tick(Instant::now());
+        let band = kitty.image(h.band(2).id);
+        assert_eq!((band.width(), pixel(&band, 0, 0)[0]), (30, 2), "a band of page 3 alone is as wide as it");
+
+        // Pages filled to the width make bands as wide as the viewport.
+        let mut h = harness(Pages::new(vec![rows_page(0, 30, 100), rows_page(1, 50, 100)]), kitty.clone(), false);
+        let shown = h.show(0, 0.0, StripRequest { fill: true, ..request(10, 10) }).shown.expect("a frame");
+        let width = h.view().width;
+        assert!(matches!(shown.scene.layers[..], [Layer::KittySlice { left: 0, width: w, .. }] if w == width), "{:?}", shown.scene.layers);
+        assert_eq!(kitty.image(h.band(0).id).width(), width);
+    }
+}
+
+#[test]
 fn a_sliding_glide_of_one_viewport_uploads_only_the_band_that_comes_into_reach() {
     let kitty = Recorder::sliding(CELL);
     let mut h = harness(Pages::new((0..20).map(|i| rows_page(i, 80, 400)).collect()), kitty, false);
@@ -580,6 +616,92 @@ fn a_sliding_glide_of_one_viewport_uploads_only_the_band_that_comes_into_reach()
     assert_eq!(h.view().top, 160.0);
     assert_eq!(uploads, [h.band(2).id], "only the band below the viewport's new bottom uploads");
     assert!(offsets.len() > 3, "the view moves by the pixel: {offsets:?}");
+}
+
+#[test]
+fn bands_around_the_viewport_wait_for_room_in_the_budget() {
+    // Bands of 80 x 160 opaque pixels count 38,400 bytes once kept, and
+    // 51,200 until the first one of a view is; the budget holds two and a
+    // half.
+    let resident = Resident::new(ImageIds::with_base(0x100), false).with_budget(100_000);
+    let mut h = harness_on(Pages::new((0..20).map(|i| rows_page(i, 80, 400)).collect()), Recorder::sliding(CELL), resident);
+    h.show(0, 0.0, request(10, 10));
+    let old = h.band(0);
+    h.band(1);
+    // The app pins the band on screen while the strip jumps.
+    h.resident.pin([old.id]);
+    assert!(h.show(10, 0.0, request(10, 10)).shown.is_some(), "the band in view comes past the budget");
+    assert_eq!(h.view().bands.len(), 1, "the bands around it wait");
+    h.resident.pin([h.band(0).id]);
+    assert_eq!(h.resident.take_freed(), [old.id]);
+    h.strip.room_freed();
+    h.settle(Update::default());
+    h.band(1);
+    assert!(!h.view().bands.contains_key(&-1), "the band below comes first and fills the budget");
+}
+
+#[test]
+fn a_band_around_the_viewport_that_counts_more_than_its_lease_gives_way() {
+    // An opaque band of 80 x 160 pixels counts 38,400 bytes. The strip ends
+    // halfway down the band below, which keeps clear rows and counts 51,200:
+    // leased as opaque, it passes the budget once it is known.
+    let kitty = Recorder::sliding(CELL);
+    let resident = Resident::new(ImageIds::with_base(0x100), false).with_budget(80_000);
+    let mut h = harness_on(Pages::new(vec![rows_page(0, 80, 160), rows_page(1, 80, 80)]), kitty.clone(), resident);
+    assert!(h.show(0, 0.0, request(10, 10)).shown.is_some());
+    assert_eq!((h.view().bands.len(), kitty.renders()), (1, 2), "the band below rendered and gave way");
+    assert_eq!(h.resident.take_freed().len(), 1);
+    h.strip.room_freed();
+    h.settle(Update::default());
+    assert_eq!(kitty.renders(), 2, "it waits for the room it needs");
+    // In view it comes, room or not.
+    h.scroll(5.0);
+    h.band(1);
+}
+
+#[test]
+fn the_band_behind_gives_its_room_to_the_band_ahead() {
+    // The budget holds three bands of 38,400 bytes; a viewport across two
+    // bands wants four.
+    let resident = Resident::new(ImageIds::with_base(0x100), false).with_budget(120_000);
+    let mut h = harness_on(Pages::new((0..20).map(|i| rows_page(i, 80, 400)).collect()), Recorder::sliding(CELL), resident);
+    h.show(5, 0.0, request(10, 10));
+    let held = |h: &Harness| {
+        let mut held: Vec<i64> = h.view().bands.keys().copied().collect();
+        held.sort_unstable();
+        held
+    };
+    assert_eq!(held(&h), [-1, 0, 1], "one band in view and the two around it fit");
+    // The terminal lets go of an image once the app took its freed id.
+    let free = |h: &mut Harness| {
+        assert_eq!(h.resident.take_freed().len(), 1);
+        h.strip.room_freed();
+        h.settle(Update::default());
+    };
+    h.scroll(5.0);
+    assert_eq!(held(&h), [0, 1], "moving down, the band above leaves for the one below");
+    free(&mut h);
+    assert_eq!(held(&h), [0, 1, 2]);
+    h.band(2);
+    h.scroll(-1.0);
+    assert_eq!(held(&h), [0, 1], "moving up, the band below leaves for the one above");
+    free(&mut h);
+    assert_eq!(held(&h), [-1, 0, 1]);
+    h.band(-1);
+
+    // A budget of four bands holds the band behind: the band ahead waits
+    // only until the band that left the view left the terminal.
+    let resident = Resident::new(ImageIds::with_base(0x100), false).with_budget(160_000);
+    let mut h = harness_on(Pages::new((0..20).map(|i| rows_page(i, 80, 400)).collect()), Recorder::sliding(CELL), resident);
+    h.show(5, 0.0, request(10, 10));
+    h.scroll(5.0);
+    assert_eq!(held(&h), [-1, 0, 1, 2]);
+    let behind = h.band(0);
+    h.scroll(10.0);
+    assert_eq!(held(&h), [0, 1, 2]);
+    free(&mut h);
+    assert_eq!(held(&h), [0, 1, 2, 3]);
+    assert_eq!(h.band(0), behind, "the band behind stayed");
 }
 
 #[test]

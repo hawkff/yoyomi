@@ -34,10 +34,11 @@ pub fn placeholder(row: u16, col: u16) -> [char; 3] {
 }
 
 /// The bytes that show `height` rows of kept image `id` from its row `top`,
-/// `width` pixels wide, `offset` pixels below the top of the cursor's cell,
-/// replacing the image's placement there was. The cursor stays.
-pub fn place(id: ImageId, width: u32, top: u32, height: u32, offset: u32) -> Vec<u8> {
-    format!("\x1b_Ga=p,i={},p=1,x=0,y={top},w={width},h={height},Y={offset},C=1,q=2\x1b\\", id.0).into_bytes()
+/// `width` pixels wide, `x_offset` pixels right of the left edge and
+/// `y_offset` pixels below the top of the cursor's cell, replacing the
+/// image's placement there was. The cursor stays.
+pub fn place(id: ImageId, width: u32, top: u32, height: u32, x_offset: u32, y_offset: u32) -> Vec<u8> {
+    format!("\x1b_Ga=p,i={},p=1,x=0,y={top},w={width},h={height},X={x_offset},Y={y_offset},C=1,q=2\x1b\\", id.0).into_bytes()
 }
 
 /// The bytes that take away the placement `place` made of image `id`. The
@@ -323,7 +324,7 @@ mod tests {
 
     #[test]
     fn place_and_unplace_bytes() {
-        assert_eq!(place(ImageId(4611), 2940, 1720, 1300, 17), b"\x1b_Ga=p,i=4611,p=1,x=0,y=1720,w=2940,h=1300,Y=17,C=1,q=2\x1b\\");
+        assert_eq!(place(ImageId(4611), 900, 1720, 1300, 7, 17), b"\x1b_Ga=p,i=4611,p=1,x=0,y=1720,w=900,h=1300,X=7,Y=17,C=1,q=2\x1b\\");
         assert_eq!(unplace(ImageId(4611)), b"\x1b_Ga=d,d=i,i=4611,p=1,q=2\x1b\\");
     }
 

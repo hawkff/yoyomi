@@ -151,7 +151,7 @@ fn a_turn_to_the_readied_page_writes_no_upload() {
 
     // Closing the book gives every id back, lowest first.
     session.app.finish();
-    let leased: Vec<u32> = (0..3).map(|_| session.resident.lease().id.0).collect();
+    let leased: Vec<u32> = (0..3).map(|_| session.resident.lease(0).id.0).collect();
     assert_eq!(set(&leased), set(&session.uploaded));
 }
 
