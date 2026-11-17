@@ -104,6 +104,9 @@ struct View {
     /// The glide under way: the time of its first tick, the top it starts
     /// from and the strip pixels it moves.
     gliding: Option<(Instant, f64, f64)>,
+    /// The time of the last tick of a glide. A move during the glide starts
+    /// the next one there, so the view moves on through the key press.
+    glided: Option<Instant>,
     /// The viewport waits for page sizes or its frame; scrolling holds until
     /// they arrive.
     waiting: bool,
@@ -158,6 +161,10 @@ impl Strip {
 
     /// How long a move takes unless `set_glide` says otherwise.
     pub const GLIDE: Duration = Duration::from_millis(280);
+
+    /// A move starts its glide at the last tick of the glide before it when
+    /// that tick is at most this old.
+    const RESUME: Duration = Duration::from_millis(50);
 
     /// Sets how long a move takes where the strip slides, for this view and
     /// later ones. Zero moves at once.
@@ -224,6 +231,7 @@ impl Strip {
             pending,
             carry,
             gliding: None,
+            glided: None,
             waiting: false,
             frame: None,
             frame_job: 0,
@@ -308,9 +316,10 @@ impl Strip {
     }
 
     /// Moves the view for the time `now`: where the strip slides, along a
-    /// glide that starts at the first tick after a move and eases out over
-    /// the glide time; elsewhere, or with a glide time of zero, all of the
-    /// scrolling still to run at once.
+    /// glide that eases out over the glide time. It starts at the first tick
+    /// after a move, or at the last tick of the glide the move came during.
+    /// Elsewhere, or with a glide time of zero, all of the scrolling still to
+    /// run moves at once.
     pub fn tick(&mut self, now: Instant) -> Update {
         let glides = self.slides() && !self.glide.is_zero();
         let Some(view) = &mut self.view else { return Update::default() };
@@ -319,13 +328,17 @@ impl Strip {
         }
         let before = view.top;
         let target = if glides && !std::mem::take(&mut self.shifted) {
-            let (start, from, distance) = *view.gliding.get_or_insert((now, before, view.pending * view.cell_h));
+            // An older tick, as before a wait for a band, would make the
+            // new glide leap.
+            let began = view.glided.filter(|&last| now.saturating_duration_since(last) <= Strip::RESUME).unwrap_or(now);
+            let (start, from, distance) = *view.gliding.get_or_insert((began, before, view.pending * view.cell_h));
             let u = (now.saturating_duration_since(start).as_secs_f64() / self.glide.as_secs_f64()).min(1.0);
             let target = from + distance * (1.0 - (1.0 - u).powi(3));
             view.pending = (from + distance - target) / view.cell_h;
+            view.glided = Some(now);
             if u == 1.0 {
                 view.pending = 0.0;
-                view.gliding = None;
+                view.stop_glide();
             }
             target
         } else {
@@ -336,7 +349,7 @@ impl Strip {
             let rows = if view.kitty { view.pending.round() } else { view.pending };
             view.carry = view.pending - rows;
             view.pending = 0.0;
-            view.gliding = None;
+            view.stop_glide();
             before + rows * view.cell_h
         };
         view.top = target;
@@ -344,7 +357,7 @@ impl Strip {
         if (view.top - target).abs() > 1e-9 {
             // An end of the strip stops the scrolling.
             view.pending = 0.0;
-            view.gliding = None;
+            view.stop_glide();
         }
         // At an end, clamped or landed on, there is no half row to keep.
         if view.at_end() {
@@ -457,6 +470,12 @@ fn scaled_size(size: Option<(u32, u32)>, request: &StripRequest, unit: f64, widt
 }
 
 impl View {
+    /// Ends the glide under way, so the next move starts from rest.
+    fn stop_glide(&mut self) {
+        self.gliding = None;
+        self.glided = None;
+    }
+
     /// Places the pages that strip rows `y0..y1` cover, as far as their sizes
     /// are known; the others start size jobs.
     fn reach(&mut self, cx: &mut Context, y0: f64, y1: f64) {
@@ -683,7 +702,7 @@ impl View {
         if moved {
             // An end of the strip turned up inside the viewport.
             self.pending = 0.0;
-            self.gliding = None;
+            self.stop_glide();
             self.carry = 0.0;
             if self.kitty {
                 self.align(&cx.resident);

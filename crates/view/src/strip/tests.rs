@@ -756,15 +756,20 @@ fn a_move_during_a_glide_goes_on_from_where_the_view_is() {
         h.tick(start + ms(elapsed));
         tops.push(h.view().top);
     }
-    assert_eq!(tops[1], tops[0], "the new glide starts where the view is");
-    assert!(tops.windows(2).all(|pair| pair[1] >= pair[0]), "no jump back: {tops:?}");
+    // The new glide starts at the last tick, 10 ms before, with the 625
+    // pixels now left to run.
+    let want = 875.0 + 625.0 * (1.0 - (1.0 - 10.0 / 280.0_f64).powi(3));
+    assert!((tops[1] - want).abs() < 1e-6, "the view moves on through the key press: {tops:?}");
+    assert!(tops.windows(2).all(|pair| pair[1] > pair[0]), "no jump back and no pause: {tops:?}");
     assert!((tops[4] - 1500.0).abs() < 1e-9, "the glide ends at the sum of both moves: {tops:?}");
     assert!(!h.strip.moving());
 
-    // Turning around drops what was left of the other direction.
+    // A move after the glide ended starts from rest, at its first tick.
     h.strip.scroll(100.0);
     h.tick(start + ms(500));
+    assert_eq!(h.view().top, tops[4]);
     h.tick(start + ms(640));
+    // Turning around drops what was left of the other direction.
     h.strip.scroll(-1.0);
     assert_eq!(h.strip.pending(), -1.0);
 }
