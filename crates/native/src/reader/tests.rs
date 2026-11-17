@@ -216,15 +216,37 @@ fn webtoon_toggles_keep_the_page_and_reset_the_view() {
 }
 
 #[test]
-fn t_leaves_theater_mode_for_pages_and_then_shows_plain_webtoon() {
-    let state = State { webtoon: true, theater: true, ..State::default() };
+fn t_and_big_t_switch_between_pages_webtoon_and_theater_mode_at_the_same_place() {
+    let state = State { page: 1, spread: true, zoom: 2.0, ..State::default() };
     let mut rig = rig(book(pages(3, 50, 100), None), state, (100, 80));
+    // A theater page is 100 x 200: 50 pixels down is a quarter of page 1.
+    rig.keys(&["T"]);
+    let state = rig.reader.state();
+    assert!(state.webtoon && state.theater && !state.spread && state.zoom == 1.0 && state.page == 1, "{state:?}");
+    rig.frame();
+    rig.reader.wheel(Wheel { dy: -25.0, precise: true, began: true, gesture: true, scale: 2.0 }, Instant::now());
+    rig.ease();
+    assert!((rig.reader.state().offset - 0.25).abs() < 1e-9, "{:?}", rig.reader.state());
+
+    // Each key switches the width at the same place, and leaves its own mode.
+    for (key, theater) in [("t", false), ("T", true)] {
+        rig.keys(&[key]);
+        let state = rig.reader.state();
+        assert!(state.webtoon && state.theater == theater, "after {key}: {state:?}");
+        let frame = rig.frame();
+        let state = rig.reader.state();
+        assert!(state.page == 1 && (state.offset - 0.25).abs() < 1e-9, "after {key}: {state:?}");
+        assert_eq!(pixel(&frame, 0, 10).map(|pixel| pixel[3]), Some(if theater { 255 } else { 0 }), "after {key}: the strip fills the width");
+    }
+    rig.keys(&["T"]);
+    let state = rig.reader.state();
+    assert!(!state.webtoon && !state.theater && state.page == 1 && state.offset == 0.0, "{state:?}");
+    assert_eq!(rig.frame().page, 1);
     rig.keys(&["t"]);
     let state = rig.reader.state();
-    assert!(!state.webtoon && !state.theater, "{state:?}");
+    assert!(state.webtoon && !state.theater && state.page == 1, "{state:?}");
     rig.keys(&["t"]);
-    let state = rig.reader.state();
-    assert!(state.webtoon && !state.theater, "{state:?}");
+    assert!(!rig.reader.state().webtoon);
 }
 
 #[test]

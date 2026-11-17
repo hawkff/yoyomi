@@ -194,15 +194,23 @@ impl Reader {
             "down" if zoomed && !webtoon => self.pan(0.0, 1.0),
             "left" if zoomed && !webtoon => self.pan(-1.0, 0.0),
             "right" if zoomed && !webtoon => self.pan(1.0, 0.0),
-            "t" => {
-                // Page mode goes on from the page at the top of the strip.
-                self.state.page = self.at().page;
-                self.state.webtoon = !webtoon;
-                self.state.theater = false;
+            // From pages, the strip at the page in view, filling the width
+            // with `T`; from the strip at the other width, this width at the
+            // same place; from the strip at this width, pages at the page on
+            // top.
+            "t" | "T" => {
+                let theater = key == "T";
+                let at = self.at();
+                let switch = webtoon && self.state.theater != theater;
+                if !switch {
+                    self.state.webtoon = !webtoon;
+                    self.strip.clear();
+                }
+                self.state.theater = theater && self.state.webtoon;
+                self.state.page = at.page;
+                self.state.offset = if switch { at.offset } else { 0.0 };
                 self.state.spread = false;
-                self.state.offset = 0.0;
                 self.reset_view();
-                self.strip.clear();
                 self.strip_shown = false;
             }
             "R" => state.quarter_turns = (state.quarter_turns + 1) & 3,
