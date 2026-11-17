@@ -147,13 +147,6 @@ impl Resident {
     pub fn ids(&self) -> impl Iterator<Item = ImageId> {
         self.ids.all()
     }
-
-    /// The ids no lease holds now. An image the terminal keeps under one of
-    /// them shows nothing anyone asked for.
-    pub fn idle(&self) -> Vec<ImageId> {
-        let state = self.state.lock();
-        self.ids.all().filter(|id| !state.leases.contains_key(id)).collect()
-    }
 }
 
 #[cfg(test)]

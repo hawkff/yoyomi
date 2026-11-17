@@ -84,8 +84,10 @@ pub struct Placement {
 /// images it draws and the clipboard copy, then ratatui's diff of the cells,
 /// then the sixel images and the kitty slices that changed, each drawn with
 /// the cursor saved and put back. The other uploads, of frames ready ahead,
-/// follow the update, so the terminal shows the frame before it parses them.
+/// and the deletes of images that left the screen follow the update, so the
+/// terminal shows the frame before it parses them.
 pub fn write_frame<W: Write>(terminal: &mut Terminal<CrosstermBackend<W>>, app: &mut App) -> io::Result<()> {
+    app.delete_freed();
     let drawn = drawn_images(app);
     let placements = placements(app);
     let (now, ahead): (Vec<Upload>, Vec<Upload>) = app.uploads.drain(..).partition(|upload| drawn.contains(&upload.id));
@@ -176,7 +178,7 @@ fn drawn_images(app: &App) -> Vec<ImageId> {
 }
 
 /// The kitty images `scene` draws.
-fn kitty_ids(scene: &Scene) -> impl Iterator<Item = ImageId> + '_ {
+pub(crate) fn kitty_ids(scene: &Scene) -> impl Iterator<Item = ImageId> + '_ {
     scene.layers.iter().filter_map(|layer| match layer {
         Layer::KittyRows { id, .. } | Layer::KittySlice { id, .. } => Some(*id),
         _ => None,
