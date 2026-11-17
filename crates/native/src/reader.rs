@@ -255,8 +255,12 @@ impl Reader {
     /// it; page mode turns a page per wheel notch or per trackpad gesture.
     pub fn wheel(&mut self, wheel: Wheel, now: Instant) {
         if self.state.webtoon {
-            let points = if wheel.precise { wheel.dy } else { wheel.dy * NOTCH_POINTS };
-            self.strip.scroll(-points * wheel.scale);
+            // A trackpad moves the view with the fingers; a notch glides.
+            if wheel.precise {
+                self.strip.shift(-wheel.dy * wheel.scale);
+            } else {
+                self.strip.scroll(-wheel.dy * NOTCH_POINTS * wheel.scale);
+            }
             return;
         }
         if !wheel.precise || !wheel.gesture {

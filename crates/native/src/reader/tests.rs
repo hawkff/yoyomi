@@ -317,7 +317,7 @@ fn plus_and_minus_set_the_glide_in_the_strip_modes_and_zoom_pages() {
 }
 
 #[test]
-fn a_key_glides_for_the_glide_time() {
+fn a_key_glides_for_the_glide_time_and_a_trackpad_moves_at_once() {
     // 400 ms from the state, less two steps of `-`.
     let state = State { webtoon: true, glide_ms: 400, ..State::default() };
     let mut rig = rig(book(pages(1, 100, 2000), None), state, (100, 80));
@@ -339,6 +339,10 @@ fn a_key_glides_for_the_glide_time() {
     assert!((half - 70.0).abs() < 1e-6 && rig.reader.moving(), "halfway through 320 ms eases 7/8 of 80 pixels: {half}");
     let end = top_at(&mut rig, 320);
     assert!((end - 80.0).abs() < 1e-6 && !rig.reader.moving(), "{end}");
+
+    rig.reader.wheel(Wheel { dy: -10.0, precise: true, began: true, gesture: true, scale: 2.0 }, start);
+    let moved = top_at(&mut rig, 330);
+    assert!((moved - 100.0).abs() < 1e-6 && !rig.reader.moving(), "10 points move 20 pixels at once: {moved}");
 }
 
 #[test]
