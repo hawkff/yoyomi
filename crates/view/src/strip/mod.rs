@@ -51,10 +51,12 @@ pub struct Strip {
     /// next scroll.
     anchor: Option<(StripPosition, StripRequest, f64, f64)>,
     view: Option<View>,
-    /// Under tmux, the ids of the bands a dropped view drew, held until the
-    /// next frame shows: after a window resize kitty leaves placeholder cells
-    /// blank when their image is uploaded again under the same id and the
-    /// cells stay unchanged, so a render never reuses an id the screen shows.
+    /// The ids of the bands a dropped view drew, held until the next frame
+    /// shows, so a render never reuses an id the screen shows. Under tmux
+    /// these are all its ready bands: after a window resize kitty leaves
+    /// placeholder cells blank when their image is uploaded again under the
+    /// same id and the cells stay unchanged. Where the strip slides, they
+    /// are the ready bands in view, whose slices stay placed until then.
     retired: Vec<Lease>,
     /// How long a move takes where the strip slides.
     glide: Duration,
@@ -434,8 +436,8 @@ impl Strip {
     }
 
     /// Drops every band and scaled page the strip keeps and gives the band
-    /// ids back to the `Resident`; under tmux the ids of ready bands come
-    /// back with the next frame.
+    /// ids back to the `Resident`; the ids `retired` holds come back with
+    /// the next frame.
     pub fn clear(&mut self) {
         self.drop_view();
         self.generation += 1;
@@ -445,19 +447,23 @@ impl Strip {
         self.cx.sizing.clear();
     }
 
-    /// Stops the view's jobs and gives its band ids back. Pages whose size did
-    /// not load ask again in the next view.
+    /// Stops the view's jobs and gives its band ids back, but those
+    /// `retired` holds. Pages whose size did not load ask again in the next
+    /// view.
     fn drop_view(&mut self) {
         self.anchor = None;
         self.shifted = false;
         self.cx.sizes.retain(|_, size| size.is_some());
         if let Some(view) = self.view.take() {
-            if let Some(cancel) = view.frame {
+            if let Some(cancel) = &view.frame {
                 cancel.cancel();
             }
-            for band in view.bands.values() {
+            let in_view = view.band_ranges().0;
+            for (index, band) in &view.bands {
                 match band {
-                    Band::Ready { lease, .. } if self.cx.resident.resend() => self.retired.push(*lease),
+                    Band::Ready { lease, .. } if self.cx.resident.resend() || (view.slides && in_view.contains(index)) => {
+                        self.retired.push(*lease);
+                    }
                     band => band.release(&self.cx.resident),
                 }
             }
