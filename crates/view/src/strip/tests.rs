@@ -1125,29 +1125,28 @@ fn under_tmux_rendering_again_draws_under_other_ids_and_then_gives_the_old_ones_
 }
 
 #[test]
-fn a_sliding_strip_holds_the_ids_of_the_bands_in_view_until_the_next_frame_shows() {
+fn a_sliding_strip_anchoring_again_releases_every_band_and_leases_no_pinned_id() {
     let mut h = harness(Pages::new((0..20).map(|i| rows_page(i, 80, 400)).collect()), Recorder::sliding(CELL), false);
     h.show(0, 0.0, request(10, 10));
     // Bands 0 and 1 show, band 2 waits below them.
     h.scroll(5.0);
     assert_eq!(h.view().band_ranges().0, 0..=1);
-    let (in_view, others) = ([h.band(0), h.band(1)], [h.band(2)]);
+    let old = [h.band(0), h.band(1), h.band(2)];
+    // The app pins the ids of the slices on screen.
+    h.resident.pin([old[0].id, old[1].id]);
 
     // The anchor page has its size, so the new view leases its bands at once.
     let update = h.strip.show(StripPosition { page: 0, offset: 0.5 }, request(10, 10));
     assert!(update.shown.is_none());
-    assert!(in_view.iter().all(|&lease| h.resident.holds(lease)), "the slices on screen keep their ids");
-    assert!(others.iter().all(|&lease| !h.resident.holds(lease)));
+    assert!(old.iter().all(|&lease| !h.resident.holds(lease)), "every old band lets go");
     let new: Vec<ImageId> = h
         .view()
         .bands
         .values()
         .filter_map(|band| if let Band::Rendering { lease, .. } | Band::Ready { lease, .. } = band { Some(lease.id) } else { None })
         .collect();
-    assert!(!new.is_empty() && new.iter().all(|id| in_view.iter().all(|lease| lease.id != *id)), "{new:?} reuses an id in view");
-
+    assert!(!new.is_empty() && new.iter().all(|id| *id != old[0].id && *id != old[1].id), "{new:?} reuses a pinned id");
     assert!(h.settle(update).shown.is_some());
-    assert!(in_view.iter().all(|&lease| !h.resident.holds(lease)), "the next frame gives them back");
 }
 
 #[test]
