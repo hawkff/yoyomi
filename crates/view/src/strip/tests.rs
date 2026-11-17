@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, unbounded};
 use parking_lot::Mutex;
 use yoyomi_core::image::Rgba;
-use yoyomi_core::{CellSize, Error, ImageIds, PageKind, Pixels, RgbaImage, fit_box};
+use yoyomi_core::{CellSize, Error, ImageIds, PageKind, Pixels, RgbaImage, cells_for, fit_box};
 use yoyomi_render::{HalfBlock, Kitty, invert, rotate, scale};
 
 use super::scaled::{SECTION_ROWS, Section, TEXT_NEEDS_PIXELS};
@@ -124,16 +124,23 @@ fn solid(width: u32, height: u32, color: [u8; 4]) -> RgbaImage {
     RgbaImage::from_pixel(width, height, Rgba(color))
 }
 
-/// Keeps every image it renders and answers with a small frame of its kind.
+/// Keeps every image it renders or keeps and answers with a small frame of
+/// its kind. A sliding recorder is kitty in a terminal that places kept
+/// images by the pixel.
 struct Recorder {
     kind: RendererKind,
     cell: CellSize,
+    slides: bool,
     images: Mutex<Vec<(ImageId, RgbaImage)>>,
 }
 
 impl Recorder {
     fn new(kind: RendererKind, cell: CellSize) -> Arc<Self> {
-        Arc::new(Recorder { kind, cell, images: Mutex::new(Vec::new()) })
+        Arc::new(Recorder { kind, cell, slides: false, images: Mutex::new(Vec::new()) })
+    }
+
+    fn sliding(cell: CellSize) -> Arc<Self> {
+        Arc::new(Recorder { kind: RendererKind::Kitty, cell, slides: true, images: Mutex::new(Vec::new()) })
     }
 
     fn renders(&self) -> usize {
@@ -174,6 +181,17 @@ impl Renderer for Recorder {
 
     fn delete(&self, _id: ImageId) -> Vec<u8> {
         Vec::new()
+    }
+
+    fn slides(&self) -> bool {
+        self.slides
+    }
+
+    fn keep(&self, image: &RgbaImage, id: ImageId) -> Result<Frame> {
+        assert!(self.slides, "a renderer that does not slide keeps nothing");
+        self.images.lock().push((id, image.clone()));
+        let grid = Grid::new(cells_for(image.width(), self.cell.w, u16::MAX), cells_for(image.height(), self.cell.h, u16::MAX));
+        Ok(Frame::Kitty { id, grid, upload: format!("kept {}", id.0).into_bytes().into() })
     }
 }
 
@@ -478,6 +496,90 @@ fn kitty_bands_tile_the_strip_at_fractional_cell_heights() {
         }
         assert!(bands.len() >= 5);
     }
+}
+
+/// Checks that the slices of `update` show the viewport of `h` from top to
+/// bottom without a gap or an overlap, each from the rows of its band that
+/// hold its strip rows. The pages name each strip row in green and blue.
+fn assert_slices_tile_the_viewport(h: &Harness, kitty: &Recorder, update: &Update) {
+    let Some(shown) = &update.shown else { return };
+    let view = h.view();
+    let (top, cell_top) = (view.top.round() as i64, |row: u16| (f64::from(row) * view.cell_h).round() as i64);
+    let mut y = 0;
+    for layer in &shown.scene.layers {
+        let Layer::KittySlice { id, width, top: from, height, at, offset } = *layer else { panic!("not a slice: {layer:?}") };
+        assert_eq!((width, at.col), (view.width, 0), "{layer:?}");
+        assert!(at.row < view.rows && f64::from(offset) < view.cell_h.ceil(), "{layer:?}");
+        assert_eq!(cell_top(at.row) + i64::from(offset), y, "{layer:?} starts where the slice above ends");
+        let band = kitty.image(id);
+        assert!(height > 0 && from + height <= band.height(), "{layer:?} inside a band of {} rows", band.height());
+        for row in 0..height {
+            let [_, high, low, _] = pixel(&band, band.width() / 2, from + row);
+            assert_eq!(i64::from((u32::from(high) << 8) | u32::from(low)), top + y + i64::from(row), "{layer:?} row {row}");
+        }
+        y += i64::from(height);
+    }
+    assert_eq!(y, i64::from(view.height), "the slices fill the viewport");
+}
+
+#[test]
+fn sliding_slices_cover_the_viewport_at_any_pixel() {
+    let page = RgbaImage::from_fn(20, 6000, |_, y| Rgba([0, (y >> 8) as u8, y as u8, 255]));
+    for ((cell_w, cell_h), (cols, rows)) in [((8.0, 16.0), (10, 10)), ((7.3, 15.6), (7, 33)), ((8.4, 17.3), (9, 41)), ((8.0, 17.3), (5, 7))] {
+        let kitty = Recorder::sliding(CellSize { w: cell_w, h: cell_h });
+        let mut h = harness(Pages::new(vec![page.clone()]), kitty.clone(), false);
+        assert!(h.strip.slides());
+        let shown = h.show(0, 0.0, request(cols, rows));
+        assert!(shown.shown.is_some());
+        assert_slices_tile_the_viewport(&h, &kitty, &shown);
+        let mut moved = 0.0;
+        for step in 0.. {
+            // From a twentieth of the viewport to most of one, never a whole row.
+            let next = f64::from(rows) * (0.05 + f64::from(step % 7) * 0.13) + 0.29;
+            if (moved + next) * cell_h + f64::from(h.view().height) > 5900.0 {
+                assert!(step > 10, "{step} steps");
+                break;
+            }
+            moved += next;
+            h.strip.shift(next);
+            let update = h.strip.tick(Instant::now());
+            let update = h.settle(update);
+            assert!((h.view().top - moved * cell_h).abs() < 1e-6, "the top is {}, want {}", h.view().top, moved * cell_h);
+            assert!(update.shown.is_some(), "step {step}");
+            assert_slices_tile_the_viewport(&h, &kitty, &update);
+        }
+    }
+}
+
+#[test]
+fn a_sliding_glide_of_one_viewport_uploads_only_the_band_that_comes_into_reach() {
+    let kitty = Recorder::sliding(CELL);
+    let mut h = harness(Pages::new((0..20).map(|i| rows_page(i, 80, 400)).collect()), kitty, false);
+    let ids = |update: &Update| update.uploads.iter().map(|upload| upload.id).collect::<Vec<_>>();
+    let shown = h.show(0, 0.0, request(10, 10));
+    assert_eq!(ids(&shown).into_iter().collect::<HashSet<_>>(), HashSet::from([h.band(0).id, h.band(1).id]));
+    h.strip.scroll(10.0);
+    let start = Instant::now();
+    let (mut uploads, mut offsets) = (Vec::new(), HashSet::new());
+    for frame in 0.. {
+        if !h.strip.moving() {
+            break;
+        }
+        assert!(frame < 1000, "the glide ends");
+        let update = h.strip.tick(start + Duration::from_millis(10) * frame);
+        let update = h.settle(update);
+        uploads.extend(ids(&update));
+        for layer in update.shown.iter().flat_map(|shown| &shown.scene.layers) {
+            let Layer::KittySlice { offset, .. } = layer else { panic!("not a slice: {layer:?}") };
+            offsets.insert(*offset);
+        }
+        let visible = h.view().band_ranges().0;
+        let kept: Vec<i64> = h.view().bands.keys().copied().collect();
+        assert!(kept.iter().all(|index| (visible.start() - 1..=visible.end() + 1).contains(index)), "{kept:?} beyond {visible:?}");
+    }
+    assert_eq!(h.view().top, 160.0);
+    assert_eq!(uploads, [h.band(2).id], "only the band below the viewport's new bottom uploads");
+    assert!(offsets.len() > 3, "the view moves by the pixel: {offsets:?}");
 }
 
 #[test]
@@ -1020,6 +1122,31 @@ fn under_tmux_rendering_again_draws_under_other_ids_and_then_gives_the_old_ones_
     let drawn = |update: &Update| kitty_rows(update).into_iter().map(|(id, ..)| id).collect::<Vec<_>>();
     assert!(drawn(&again).iter().all(|id| !drawn(&before).contains(id)), "{:?} reuses an id of {:?}", drawn(&again), drawn(&before));
     assert!(leases.iter().all(|&lease| !h.resident.holds(lease)));
+}
+
+#[test]
+fn a_sliding_strip_anchoring_again_releases_every_band_and_leases_no_pinned_id() {
+    let mut h = harness(Pages::new((0..20).map(|i| rows_page(i, 80, 400)).collect()), Recorder::sliding(CELL), false);
+    h.show(0, 0.0, request(10, 10));
+    // Bands 0 and 1 show, band 2 waits below them.
+    h.scroll(5.0);
+    assert_eq!(h.view().band_ranges().0, 0..=1);
+    let old = [h.band(0), h.band(1), h.band(2)];
+    // The app pins the ids of the slices on screen.
+    h.resident.pin([old[0].id, old[1].id]);
+
+    // The anchor page has its size, so the new view leases its bands at once.
+    let update = h.strip.show(StripPosition { page: 0, offset: 0.5 }, request(10, 10));
+    assert!(update.shown.is_none());
+    assert!(old.iter().all(|&lease| !h.resident.holds(lease)), "every old band lets go");
+    let new: Vec<ImageId> = h
+        .view()
+        .bands
+        .values()
+        .filter_map(|band| if let Band::Rendering { lease, .. } | Band::Ready { lease, .. } = band { Some(lease.id) } else { None })
+        .collect();
+    assert!(!new.is_empty() && new.iter().all(|id| *id != old[0].id && *id != old[1].id), "{new:?} reuses a pinned id");
+    assert!(h.settle(update).shown.is_some());
 }
 
 #[test]

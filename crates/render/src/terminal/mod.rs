@@ -65,7 +65,8 @@ pub fn needs_probe(force: Option<RendererKind>) -> bool {
 
 /// Picks a renderer: `force` when given, otherwise kitty where the terminal
 /// speaks it, sixel where its device attributes list it, and half blocks
-/// elsewhere. Under tmux it turns on passthrough for the kitty renderer.
+/// elsewhere. Under tmux it turns on passthrough for the kitty renderer;
+/// outside a multiplexer and herdr the kitty renderer slides.
 pub fn detect(terminal: &Terminal, force: Option<RendererKind>) -> Arc<dyn Renderer> {
     let cell = cell_size(terminal);
     match choose(terminal, force, &process_env, tmux_client) {
@@ -82,7 +83,7 @@ pub fn detect(terminal: &Terminal, force: Option<RendererKind>) -> Arc<dyn Rende
                         .is_ok_and(|s| s.success())
                 });
             }
-            Arc::new(Kitty::new(cell, tmux))
+            Arc::new(Kitty::new(cell, tmux).with_slides(kitty_slides(&process_env)))
         }
         RendererKind::Sixel => Arc::new(Sixel::new(cell, terminal.colors).with_background(terminal.background)),
         _ => Arc::new(HalfBlock::new(cell)),
@@ -188,6 +189,13 @@ fn in_herdr(env: Env) -> bool {
 /// background color.
 fn in_iterm2(env: Env) -> bool {
     outside_multiplexer(env) && env("TERM_PROGRAM") == "iTerm.app"
+}
+
+/// Whether the terminal places kept kitty images by the pixel: a multiplexer
+/// shows only placeholder cells, and herdr draws kitty graphics for its panes
+/// through placeholders too.
+fn kitty_slides(env: Env) -> bool {
+    outside_multiplexer(env) && env("TERM_PROGRAM") != "herdr"
 }
 
 /// Whether none of GNU screen, tmux and zellij runs between yoyomi and the
@@ -340,6 +348,21 @@ mod tests {
         ];
         for (name, vars, want) in cases {
             assert_eq!(in_herdr(&env(vars)), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn kitty_slides_outside_multiplexers_and_herdr() {
+        let cases: [(&str, Vars, bool); 6] = [
+            ("kitty", &[("TERM", "xterm-kitty")], true),
+            ("Ghostty", &[("TERM_PROGRAM", "ghostty")], true),
+            ("tmux", &[("TERM_PROGRAM", "tmux"), ("TMUX", "/tmp/tmux-1000/default,1,0")], false),
+            ("screen", &[("TERM", "xterm-kitty"), ("STY", "1.pts-0")], false),
+            ("zellij", &[("TERM", "xterm-kitty"), ("ZELLIJ", "0")], false),
+            ("herdr", &[("TERM_PROGRAM", "herdr")], false),
+        ];
+        for (name, vars, want) in cases {
+            assert_eq!(kitty_slides(&env(vars)), want, "{name}");
         }
     }
 

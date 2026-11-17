@@ -20,7 +20,7 @@ use yoyomi_state::{BookKey, Bookmarks, Position, Positions, Settings};
 use yoyomi_view::{PageRequest, Pager, Resident, Shown, Strip, StripPosition, StripRequest, Update, ViewEvent};
 use yoyomi_web::Server;
 
-use crate::draw::{self, safe_text};
+use crate::draw::{self, Placement, safe_text};
 use crate::menus::{Action, Kind, Menu};
 use crate::picker::{Picked, Picker};
 use crate::search::{self, LineKey};
@@ -228,6 +228,8 @@ pub struct App {
     pub sixel_fresh: bool,
     /// Under tmux, the uploads of the images the last frame drew.
     pub drawn: Vec<Upload>,
+    /// The kitty slices the last frame left placed.
+    pub placed: Vec<Placement>,
     /// When the resize settles, and the cell size its first render used.
     settle: Option<(Instant, CellSize)>,
     last_tick: Instant,
@@ -288,6 +290,7 @@ impl App {
             uploads: Vec::new(),
             sixel_fresh: false,
             drawn: Vec::new(),
+            placed: Vec::new(),
             settle: None,
             last_tick: Instant::now(),
             quit: None,
@@ -367,6 +370,7 @@ impl App {
         self.cancel_searches();
         let name = mem::take(&mut self.panes[i].name);
         self.panes[i] = Pane { reader: Some(Reader { book, key, pager, strip, select, search }), name, ..Pane::default() };
+        self.pin_shown();
         self.serve_books();
         // A split keeps its layout; a single pane takes the saved one.
         if !self.split
@@ -383,6 +387,7 @@ impl App {
         };
         self.panes[i].page = page.min(last);
         if self.webtoon {
+            self.start_sliding();
             self.show_strip_again((StripPosition { page: page.min(last), offset }, scroll, 0.0));
         } else {
             self.show_pane(i);
@@ -540,6 +545,7 @@ impl App {
                 pane.shown = None;
             }
         }
+        self.pin_shown();
         self.sixel_fresh = true;
         self.show_all();
     }
@@ -713,6 +719,27 @@ impl App {
         pane.loading = false;
         pane.error = None;
         pane.shown = Some(shown);
+        self.pin_shown();
+    }
+
+    /// Where the renderer slides, pins the kitty ids the frames of the panes
+    /// draw, so no lease takes them until frames replace them. An overlay
+    /// leaves the pins: the frames come back when it closes.
+    fn pin_shown(&self) {
+        if self.renderer.slides() {
+            let scenes = self.panes.iter().filter_map(|pane| pane.shown.as_ref());
+            self.resident.pin(scenes.flat_map(|shown| draw::kitty_ids(&shown.scene)));
+        }
+    }
+
+    /// Where the renderer slides, queues a delete of every image whose id
+    /// was given back and no frame on screen draws. No frame draws them, so
+    /// `write_frame` sends the deletes after its frame.
+    pub(crate) fn delete_freed(&mut self) {
+        if self.renderer.slides() {
+            let deletes = self.resident.take_freed().into_iter().map(|id| Upload { id, bytes: self.renderer.delete(id).into() });
+            self.uploads.extend(deletes);
+        }
     }
 
     /// Drops what the views keep and renders again. The strip renders again
@@ -906,9 +933,28 @@ impl App {
         self.theater = theater && self.webtoon;
         self.panes[active].reset_view();
         if self.webtoon {
+            self.start_sliding();
             self.show_strip(StripPosition { page: self.panes[active].page, offset: 0.0 });
         } else {
+            // The pins keep the bands on screen until the page replaces them.
+            if let Some(reader) = &mut self.panes[active].reader
+                && self.renderer.slides()
+            {
+                reader.strip.clear();
+            }
             self.show();
+        }
+    }
+
+    /// Where the renderer slides, drops the pager's frames, which page mode
+    /// renders again; the page on screen stays, pinned, until the strip
+    /// shows. Page frames and the strip's bands together pass the image
+    /// memory of some terminals, which then drop a band.
+    fn start_sliding(&mut self) {
+        if let Some(reader) = &mut self.panes[self.active].reader
+            && self.renderer.slides()
+        {
+            reader.pager.clear();
         }
     }
 
@@ -1268,8 +1314,10 @@ impl App {
             // Kitty ids in the old scenes may already name other images.
             pane.shown = None;
         }
+        self.pin_shown();
         self.sixel_fresh = true;
         if self.webtoon {
+            self.start_sliding();
             self.show_strip(StripPosition { page: state.page, offset: state.offset });
         } else {
             self.show_all();
@@ -1712,6 +1760,7 @@ fn scroll_distance(viewport_rows: u16, fraction: f64) -> f64 {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
 
     use crossbeam_channel::{Receiver, at, never, select, unbounded};
@@ -2230,10 +2279,15 @@ pub(crate) mod tests {
     /// view jobs. With `tmux`, uploads go out with the frames that draw them
     /// and a resize renders again.
     fn kitty_reader(name: &str, tmux: bool) -> (App, Receiver<ViewEvent>) {
+        kitty_reader_on(Kitty::new(CellSize::FALLBACK, false), name, tmux)
+    }
+
+    /// An 80 x 24 reader of the fixture `name` on `renderer`, as `kitty_reader`.
+    fn kitty_reader_on(renderer: Kitty, name: &str, tmux: bool) -> (App, Receiver<ViewEvent>) {
         let (events, received) = unbounded();
         let (view_events, view_received) = unbounded();
         let resident = Arc::new(Resident::new(ImageIds::with_base(0x100), tmux));
-        let renderer = Arc::new(Kitty::new(CellSize::FALLBACK, false));
+        let renderer = Arc::new(renderer);
         let mut app = App::new(renderer, Terminal::default(), resident, Positions::load_from(None), events, view_events, (80, 24));
         app.open_books(&[fixture(name)]);
         app.on_event(received.recv_timeout(Duration::from_secs(20)).expect("the book opens"));
@@ -2321,6 +2375,412 @@ pub(crate) mod tests {
             keys(&mut app, "jj");
             assert!(!app.help && on_page(0)(&app));
             assert_eq!(frame(&mut app).matches(&page0).count(), usize::from(tmux), "tmux {tmux}: help closed");
+        }
+    }
+
+    /// A book of four pages of 100 x 336 pixels, a viewport tall at the
+    /// kitty fallback cell size, whose red channel holds the page number.
+    struct Tall;
+
+    impl Book for Tall {
+        fn path(&self) -> &Path {
+            Path::new("/books/tall.cbz")
+        }
+        fn title(&self) -> &str {
+            "Tall"
+        }
+        fn len(&self) -> usize {
+            4
+        }
+        fn kind(&self, _page: usize) -> PageKind {
+            PageKind::Image
+        }
+        fn page(&self, page: usize, cancel: &Cancel) -> Result<Pixels> {
+            cancel.check()?;
+            Ok(Arc::new(RgbaImage::from_pixel(100, 336, [page as u8 + 1, 0, 0, 255].into())))
+        }
+    }
+
+    /// Kitty that slides and holds back the first image whose top row shows
+    /// the page number of its gate.
+    struct Gated {
+        kitty: Kitty,
+        gate: std::sync::Mutex<Option<Gate>>,
+    }
+
+    /// An image held back reports on `held` and waits until the sender of
+    /// `wait` goes.
+    struct Gate {
+        page: u8,
+        wait: Receiver<()>,
+        held: Sender<()>,
+    }
+
+    impl Gated {
+        /// Holds back the next image that starts with page number `page`
+        /// until the returned sender goes; the receiver hears when it does.
+        fn gate(&self, page: u8) -> (Sender<()>, Receiver<()>) {
+            let ((open, wait), (held, holding)) = (crossbeam_channel::bounded(0), unbounded());
+            *self.gate.lock().unwrap() = Some(Gate { page, wait, held });
+            (open, holding)
+        }
+
+        fn wait(&self, image: &RgbaImage) {
+            let gate = self.gate.lock().unwrap().take_if(|gate| image.get_pixel(image.width() / 2, 0)[0] == gate.page);
+            if let Some(gate) = gate {
+                let _ = gate.held.send(());
+                let _ = gate.wait.recv();
+            }
+        }
+    }
+
+    impl Renderer for Gated {
+        fn kind(&self) -> RendererKind {
+            RendererKind::Kitty
+        }
+        fn cell_size(&self) -> CellSize {
+            self.kitty.cell_size()
+        }
+        fn set_cell_size(&self, cell: CellSize) {
+            self.kitty.set_cell_size(cell);
+        }
+        fn render(&self, image: &RgbaImage, id: yoyomi_core::ImageId, max: Grid, invert: bool) -> Result<yoyomi_core::Frame> {
+            self.wait(image);
+            self.kitty.render(image, id, max, invert)
+        }
+        fn delete(&self, id: yoyomi_core::ImageId) -> Vec<u8> {
+            self.kitty.delete(id)
+        }
+        fn slides(&self) -> bool {
+            true
+        }
+        fn keep(&self, image: &RgbaImage, id: yoyomi_core::ImageId) -> Result<yoyomi_core::Frame> {
+            self.wait(image);
+            self.kitty.keep(image, id)
+        }
+    }
+
+    /// An 80 x 24 sliding kitty reader with `Tall` open at each of `pages`,
+    /// one pane per page, in webtoon mode with `webtoon`; the receiver of
+    /// its view jobs; its renderer.
+    fn gated_reader(pages: &[usize], webtoon: bool) -> (App, Receiver<ViewEvent>, Arc<Gated>) {
+        let (events, _) = unbounded();
+        let (view_events, views) = unbounded();
+        let resident = Arc::new(Resident::new(ImageIds::with_base(0x100), false));
+        let renderer = Arc::new(Gated { kitty: Kitty::new(CellSize::FALLBACK, false).with_slides(true), gate: std::sync::Mutex::new(None) });
+        let mut app = App::new(renderer.clone(), Terminal::default(), resident, Positions::load_from(None), events, view_events, (80, 24));
+        (app.split, app.webtoon) = (pages.len() > 1, webtoon);
+        for (i, &page) in pages.iter().enumerate() {
+            let request = app.expect_open(i, Path::new("/books/tall.cbz"), Some(page));
+            app.on_event(Event::Opened { request, book: Ok(Arc::new(Tall)) });
+        }
+        (app, views, renderer)
+    }
+
+    /// The kitty uploads and deletes in `bytes` in order, by image id: an
+    /// upload with whether it keeps the image without a placement, or `None`
+    /// for a delete that no upload of the id goes on with.
+    fn kitty_acts(bytes: &str) -> Vec<(u32, Option<bool>)> {
+        fn key<'a>(keys: &'a str, name: &str) -> Option<&'a str> {
+            keys.split(',').find_map(|pair| pair.strip_prefix(name))
+        }
+        let commands: Vec<&str> =
+            bytes.split("\x1b_G").skip(1).map(|command| &command[..command.find([';', '\x1b']).unwrap_or(command.len())]).collect();
+        let upload = |keys: &str| matches!(key(keys, "a="), Some("t" | "T"));
+        let mut acts = Vec::new();
+        for (n, &keys) in commands.iter().enumerate() {
+            let Some(id) = key(keys, "i=").and_then(|id| id.parse().ok()) else { continue };
+            if upload(keys) {
+                acts.push((id, Some(key(keys, "a=") == Some("t"))));
+            // Every upload starts with a delete of its id.
+            } else if key(keys, "a=") == Some("d")
+                && key(keys, "d=") == Some("I")
+                && !commands.get(n + 1).is_some_and(|&next| upload(next) && key(next, "i=") == key(keys, "i="))
+            {
+                acts.push((id, None));
+            }
+        }
+        acts
+    }
+
+    /// The frames a sliding kitty reader writes, each checked against the
+    /// screen before it: no upload to and no delete of an image on screen
+    /// reaches the terminal before the frame that replaces it, an image that
+    /// left the screen is deleted at most once after it, or replaced by the
+    /// upload of a new image under its id, and after each frame the terminal
+    /// keeps only images that the frame draws or a lease holds.
+    struct Screen {
+        terminal: ratatui::Terminal<CrosstermBackend<Recorder>>,
+        written: Recorder,
+        /// The kitty ids the last frame drew.
+        shown: BTreeSet<u32>,
+        /// The images the terminal keeps, by id, and whether each was kept
+        /// without a placement, as bands are.
+        images: BTreeMap<u32, bool>,
+        /// The images that left the screen and were not replaced, by id, and
+        /// how often each was deleted since.
+        left: BTreeMap<u32, usize>,
+    }
+
+    impl Screen {
+        fn new() -> Self {
+            let options = TerminalOptions { viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)) };
+            let written = Recorder::default();
+            let terminal = ratatui::Terminal::with_options(CrosstermBackend::new(written.clone()), options).unwrap();
+            Screen { terminal, written, shown: BTreeSet::new(), images: BTreeMap::new(), left: BTreeMap::new() }
+        }
+
+        /// Writes a frame, as the event loop does after every event, and
+        /// checks it.
+        fn frame(&mut self, app: &mut App) {
+            let drawn: BTreeSet<u32> =
+                (0..app.pane_count()).filter_map(|i| app.shown(i)).flat_map(|shown| draw::kitty_ids(&shown.scene)).map(|id| id.0).collect();
+            let before = self.written.text().len();
+            write_frame(&mut self.terminal, app).unwrap();
+            let out = self.written.text()[before..].to_owned();
+            let end = out.find("\x1b[?2026l").expect("the frame ends");
+            self.left.extend(self.shown.difference(&drawn).map(|&id| (id, 0)));
+            self.left.retain(|id, _| !drawn.contains(id));
+            // Until the frame ends the old one shows, after it the new one.
+            for (part, on_screen) in [(&out[..end], &self.shown), (&out[end..], &drawn)] {
+                for (id, upload) in kitty_acts(part) {
+                    assert!(!on_screen.contains(&id), "image {id} changes on screen: {out:?}");
+                    if let Some(kept) = upload {
+                        self.images.insert(id, kept);
+                        self.left.remove(&id);
+                    } else {
+                        self.images.remove(&id);
+                        if let Some(deletes) = self.left.get_mut(&id) {
+                            *deletes += 1;
+                            assert_eq!(*deletes, 1, "image {id} is deleted once");
+                        }
+                    }
+                }
+            }
+            let idle = |id: &&u32| !drawn.contains(id) && !app.resident.leased(yoyomi_core::ImageId(**id));
+            let idle: Vec<&u32> = self.images.keys().filter(idle).collect();
+            assert!(idle.is_empty(), "the terminal keeps images nobody holds or shows: {idle:?}");
+            self.shown = drawn;
+        }
+
+        /// Presses each key in turn, with a frame after each.
+        fn press(&mut self, app: &mut App, pressed: &str) {
+            for key in pressed.chars() {
+                keys(app, &key.to_string());
+                self.frame(app);
+            }
+        }
+
+        /// Runs the event loop on finished view jobs and timers until
+        /// `done`, with a frame after every event.
+        fn run(&mut self, app: &mut App, views: &Receiver<ViewEvent>, done: impl Fn(&App, &Screen) -> bool) {
+            let limit = Instant::now() + Duration::from_secs(20);
+            while !done(app, self) {
+                let timer = app.deadline().map_or_else(never, at);
+                select! {
+                    recv(views) -> event => app.on_view_event(event.unwrap()),
+                    recv(timer) -> _ => app.on_timer(Instant::now()),
+                    recv(at(limit)) -> _ => panic!("the views did not settle: left {:?}, kept {:?}", self.left, self.images),
+                }
+                self.frame(app);
+            }
+        }
+
+        /// Runs the loop until `holding` hears that a gate holds its image
+        /// back.
+        fn hold(&mut self, app: &mut App, views: &Receiver<ViewEvent>, holding: &Receiver<()>) {
+            let limit = Instant::now() + Duration::from_secs(20);
+            loop {
+                let timer = app.deadline().map_or_else(never, at);
+                select! {
+                    recv(holding) -> held => return held.expect("the gate stays"),
+                    recv(views) -> event => app.on_view_event(event.unwrap()),
+                    recv(timer) -> _ => app.on_timer(Instant::now()),
+                    recv(at(limit)) -> _ => panic!("no image came to the gate"),
+                }
+                self.frame(app);
+            }
+        }
+
+        /// Runs the loop until every pane shows its latest frame and nothing
+        /// scrolls.
+        fn settle(&mut self, app: &mut App, views: &Receiver<ViewEvent>) {
+            self.run(app, views, |app, _| (0..app.pane_count()).all(|i| !app.panes[i].loading) && app.deadline().is_none());
+        }
+
+        /// The images the terminal keeps, bands or pages.
+        fn kept(&self, bands: bool) -> usize {
+            self.images.values().filter(|&&kept| kept == bands).count()
+        }
+
+        /// Whether the image under `id` left the screen and the terminal.
+        fn gone(&self, id: u32) -> bool {
+            !self.shown.contains(&id) && self.left.get(&id).is_none_or(|&deletes| deletes == 1)
+        }
+
+        /// Runs the loop until every image that left the screen left the
+        /// terminal and the terminal keeps no image of the mode the reader
+        /// left. Renders still under way may hold such an image until their
+        /// upload replaces it.
+        fn finish(&mut self, app: &mut App, views: &Receiver<ViewEvent>) {
+            self.run(app, views, |app, screen| screen.left.values().all(|&deletes| deletes == 1) && screen.kept(!app.webtoon) == 0);
+        }
+    }
+
+    /// The kitty ids pane `i` shows.
+    fn on_screen(app: &App, i: usize) -> BTreeSet<u32> {
+        app.shown(i).map(|shown| draw::kitty_ids(&shown.scene).map(|id| id.0).collect()).unwrap_or_default()
+    }
+
+    #[test]
+    fn pages_to_a_sliding_strip_keep_the_page_until_the_strip_shows() {
+        let (mut app, views, renderer) = gated_reader(&[1], false);
+        let mut screen = Screen::new();
+        screen.frame(&mut app);
+        screen.run(&mut app, &views, |_, screen| screen.kept(false) == 3);
+        let page = on_screen(&app, 0);
+        // The visible band waits until the bands around it uploaded.
+        let (open, _) = renderer.gate(2);
+        screen.press(&mut app, "t");
+        screen.run(&mut app, &views, |app, screen| {
+            assert!(app.panes[0].loading, "the visible band waits");
+            screen.kept(true) == 2
+        });
+        assert_eq!(screen.shown, page, "page 2 shows until the strip does");
+        drop(open);
+        screen.settle(&mut app, &views);
+        screen.finish(&mut app, &views);
+        assert!(page.iter().all(|&id| screen.gone(id)), "{:?}", screen.left);
+    }
+
+    #[test]
+    fn a_strip_mode_while_a_page_turn_loads_keeps_the_page_on_screen() {
+        let (mut app, views, renderer) = gated_reader(&[1], false);
+        let mut screen = Screen::new();
+        screen.frame(&mut app);
+        screen.run(&mut app, &views, |_, screen| screen.kept(false) == 3);
+        // Page 3 shows at once, page 4 renders ahead and waits.
+        let (open, holding) = renderer.gate(4);
+        screen.press(&mut app, "j");
+        screen.hold(&mut app, &views, &holding);
+        screen.press(&mut app, "j");
+        assert!(app.panes[0].loading && app.shown(0).is_some_and(|shown| shown.page == 2));
+        let page = on_screen(&app, 0);
+        screen.press(&mut app, "t");
+        screen.settle(&mut app, &views);
+        screen.finish(&mut app, &views);
+        assert!(app.webtoon && page.iter().all(|&id| screen.gone(id)), "{:?}", screen.left);
+        drop(open);
+    }
+
+    #[test]
+    fn r_before_the_first_frame_of_a_sliding_strip_keeps_the_page_on_screen() {
+        let (mut app, views, renderer) = gated_reader(&[1], false);
+        let mut screen = Screen::new();
+        screen.frame(&mut app);
+        screen.run(&mut app, &views, |_, screen| screen.kept(false) == 3);
+        let page = on_screen(&app, 0);
+        let (open, holding) = renderer.gate(2);
+        screen.press(&mut app, "t");
+        screen.run(&mut app, &views, |_, screen| screen.kept(true) == 2);
+        // The band in view is the one held back, so `r` comes before the
+        // strip's first frame.
+        screen.hold(&mut app, &views, &holding);
+        screen.press(&mut app, "r");
+        screen.settle(&mut app, &views);
+        screen.finish(&mut app, &views);
+        assert!(page.iter().all(|&id| screen.gone(id)), "{:?}", screen.left);
+        drop(open);
+    }
+
+    #[test]
+    fn a_jump_while_a_glide_waits_for_a_band_keeps_the_slices_on_screen() {
+        let (mut app, views, renderer) = gated_reader(&[0], true);
+        let mut screen = Screen::new();
+        screen.frame(&mut app);
+        screen.settle(&mut app, &views);
+        // The glide reaches page 3, whose band is held back, and waits.
+        let (open, holding) = renderer.gate(3);
+        screen.press(&mut app, "2j");
+        screen.hold(&mut app, &views, &holding);
+        screen.run(&mut app, &views, |app, _| app.panes[0].loading);
+        let slices = on_screen(&app, 0);
+        assert!(!slices.is_empty());
+        screen.press(&mut app, "G");
+        screen.settle(&mut app, &views);
+        screen.finish(&mut app, &views);
+        assert!(slices.iter().all(|&id| screen.gone(id)), "{:?}", screen.left);
+        drop(open);
+    }
+
+    #[test]
+    fn a_jump_without_a_glide_keeps_the_band_on_screen_until_the_new_one_shows() {
+        let (mut app, views, _renderer) = gated_reader(&[0], true);
+        let mut screen = Screen::new();
+        screen.frame(&mut app);
+        screen.settle(&mut app, &views);
+        screen.press(&mut app, &"-".repeat(7));
+        assert!(app.status_left().ends_with("glide off"), "{}", app.status_left());
+        let band = on_screen(&app, 0);
+        screen.press(&mut app, "3j");
+        screen.settle(&mut app, &views);
+        screen.finish(&mut app, &views);
+        assert!(band.iter().all(|&id| screen.gone(id)), "{:?}", screen.left);
+    }
+
+    #[test]
+    fn leaving_a_sliding_strip_deletes_its_bands_once_the_page_shows() {
+        let (mut app, views, _renderer) = gated_reader(&[0], true);
+        let mut screen = Screen::new();
+        screen.frame(&mut app);
+        screen.settle(&mut app, &views);
+        let bands = on_screen(&app, 0);
+        screen.press(&mut app, "t");
+        assert!(!app.webtoon && screen.shown == bands, "the strip shows until the page does");
+        screen.settle(&mut app, &views);
+        // No band stays leased: every band the strip kept leaves the terminal.
+        screen.finish(&mut app, &views);
+        assert!(bands.iter().all(|&id| screen.gone(id)), "{:?}", screen.left);
+    }
+
+    #[test]
+    fn a_frame_in_one_pane_neither_deletes_nor_unpins_the_image_of_the_other() {
+        let (mut app, views, renderer) = gated_reader(&[1, 3], false);
+        let mut screen = Screen::new();
+        screen.frame(&mut app);
+        screen.settle(&mut app, &views);
+        let (left, right) = (on_screen(&app, 0), on_screen(&app, 1));
+        // The left pane's page renders again only once the right one shows.
+        let (open, _) = renderer.gate(2);
+        screen.press(&mut app, "r");
+        screen.run(&mut app, &views, |app, _| !app.panes[1].loading);
+        assert!(app.panes[0].loading && on_screen(&app, 0) == left && on_screen(&app, 1) != right);
+        assert!(left.iter().all(|id| !screen.left.contains_key(id)));
+        drop(open);
+        screen.settle(&mut app, &views);
+        screen.finish(&mut app, &views);
+        assert!(left.iter().chain(&right).all(|&id| screen.gone(id)), "{:?}", screen.left);
+    }
+
+    #[test]
+    fn a_strip_that_cannot_slide_leaves_the_pages_in_the_terminal() {
+        let (mut app, views) = kitty_reader("nested.cbz", false);
+        run_views(&mut app, &views, |app| app.uploads.len() == 2);
+        let pages: Vec<_> = app.uploads.drain(..).map(|upload| upload.id).collect();
+        keys(&mut app, "t");
+        run_views(&mut app, &views, |app| !app.panes[0].loading);
+        app.delete_freed();
+        assert!(app.uploads.iter().all(|upload| !pages.contains(&upload.id)), "the pages stay in the terminal");
+    }
+
+    #[test]
+    fn a_strip_mode_from_the_native_window_starts_sliding_too() {
+        for slides in [true, false] {
+            let (mut app, views) = kitty_reader_on(Kitty::new(CellSize::FALLBACK, false).with_slides(slides), "nested.cbz", false);
+            run_views(&mut app, &views, |app| app.uploads.len() == 2);
+            app.native_return(yoyomi_native::State { webtoon: true, theater: true, ..yoyomi_native::State::default() });
+            assert_eq!(app.resident.take_freed().len(), if slides { 2 } else { 0 }, "slides {slides}: the pages let go");
+            app.native_return(yoyomi_native::State::default());
         }
     }
 
