@@ -338,7 +338,7 @@ default openers in the "open with" menu, write `use = ["yy", "open"]`.
 | `J` / `K` | next / previous page or spread; in webtoon mode, half a viewport |
 | `g` / `G` | first / last page (`42G` goes to page 42) |
 | `z` | focus mode: hide the titles and the status bar |
-| `t` | webtoon mode: one continuous strip with eased scrolling (single pane); wide pages shrink to fit, narrow pages keep their size |
+| `t` | webtoon mode: one continuous strip (single pane); wide pages shrink to fit, narrow pages keep their size |
 | `T` | theater mode: webtoon mode with every page as wide as the pane (single pane) |
 | `s` | two-page spread (single pane) |
 | `w` | switch pane |
@@ -357,7 +357,7 @@ default openers in the "open with" menu, write `use = ["yy", "open"]`.
 | `S` | save the page as PNG (`$YOYOMI_SHOT_DIR` or the current directory) |
 | `R` | rotate 90° clockwise |
 | `i` | invert the active pane: text pages in books, whole pages in comics, PDF and DJVU |
-| `+` / `-` / `0` | zoom in / out / reset |
+| `+` / `-` / `0` | zoom in / out / reset; in webtoon and theater mode, `+` / `-` make the glide longer / shorter |
 | arrows | pan while zoomed; scroll a text page that overflows the pane |
 | mouse wheel | next / previous page; in webtoon mode, scroll |
 | `r` | render again |
@@ -408,6 +408,14 @@ screen. `t` switches to webtoon mode in the same place, with each page at
 its own width, and `T` switches back. `Q` saves the mode with the position,
 and `f` takes it to the macOS window.
 
+With kitty graphics outside tmux, GNU screen, zellij and herdr, a move in
+webtoon or theater mode glides. The strip slides by pixels and slows to a
+stop. `+` and `-` change the glide time in steps of 40 ms, from 0, which
+moves at once, to 600 ms. The time starts at 280 ms and shows in the status
+bar. When yoyomi quits, it saves the time in `settings.json` beside the
+positions. Inside those multiplexers, and with sixel and half blocks, a
+move draws the new screen at once.
+
 ## Mouse
 
 On book and PDF pages, drag to select text. yoyomi highlights the selection
@@ -434,15 +442,17 @@ there to use the terminal's own selection.
 ## macOS window
 
 `f` opens the active pane's book in a fullscreen window and hands over the
-page, the webtoon position, rotation, zoom, spread and inversion. `f` in
-the window brings them back to the terminal. The window draws at the
-screen's full resolution and, like the terminal, turns to pages rendered
-ahead. Its keys follow the terminal's: counts, `j`/`k`/`J`/`K`, `g`/`G`
-(`42G` goes to page 42), `s`, `t`, `R`, `i`, `+`/`-`/`0` and the arrows to
-pan. The mouse wheel and the trackpad turn pages, or scroll in webtoon
-mode, and a click follows a link. `Q` saves the positions of the open books
-and quits. `q` or closing the window forgets them and quits. On other
-systems, `f` reports that the window is unavailable.
+page, the webtoon or theater position, the glide time, rotation, zoom,
+spread and inversion. `f` in the window brings them back to the terminal.
+The window draws at the screen's full resolution and, like the terminal,
+turns to pages rendered ahead. Its keys follow the terminal's: counts,
+`j`/`k`/`J`/`K`, `g`/`G` (`42G` goes to page 42), `s`, `t`, `T`, `R`, `i`,
+`+`/`-`/`0` and the arrows to pan. The mouse wheel and the trackpad turn
+pages, and a click follows a link. In webtoon and theater mode, keys and
+the wheel glide, and the strip follows the fingers on the trackpad. `Q`
+saves the positions of the open books and quits. `q` or closing the window
+forgets them and quits. On other systems, `f` reports that the window is
+unavailable.
 
 ## Browser reader
 
@@ -506,10 +516,22 @@ because tmux can drop what arrives early.
 
 ### Webtoon mode
 
-Each page scales once to the viewport width. In kitty the strip goes to the
-terminal as bands it keeps, so scrolling back over them sends no image
-data, and only the bands coming into reach upload. Sixel and half blocks
-send a new image of the viewport for each frame of a scroll.
+Pages scale to the width of the strip in sections of 1024 rows, and only
+the sections a frame needs. In kitty the strip goes to the terminal as
+bands it keeps, so scrolling back over them sends no image data, and only
+the bands coming into reach upload.
+
+Outside a multiplexer the terminal keeps each band as an image without a
+placement, and a frame shows the rows in view through placements at a pixel
+offset. A placement sent again replaces the one before, so a frame of a
+glide costs one short command per band. Terminals keep a limited amount of
+image data and drop images past it. yoyomi deletes an image once no frame
+on screen draws it and no view keeps it, and never before the frame that
+replaces it is on screen.
+
+Inside tmux the bands sit in placeholder cells, which move by whole rows,
+so a move draws the new screen at once. Sixel and half blocks send one new
+image of the viewport per move.
 
 ### Renderers
 
@@ -584,16 +606,18 @@ scans and a webtoon of 800 × 6000 pages.
 | Renderer | Action | Time | Data sent |
 |---|---|---|---|
 | kitty | page turn | 1 ms | placeholder cells; the page was in the terminal already |
-| kitty | webtoon `j` | 0.15 s | 2.4 MiB |
-| sixel | page turn | 2 ms | one sixel image |
-| sixel | webtoon `j` | 0.5 s | 16 MiB |
-| halfblock | page turn | 1 ms | one screen of cells |
-| halfblock | webtoon `j` | 0.16 s | 2.7 MiB |
+| kitty | webtoon `j` | 0.29 s | 3.1 MiB |
+| sixel | page turn | 5 ms | one sixel image |
+| sixel | webtoon `j` | 30 ms | 0.5 MiB |
+| halfblock | page turn | 2 ms | one screen of cells |
+| halfblock | webtoon `j` | 4 ms | 0.1 MiB |
 
-A webtoon `j` eases over about 0.15 s. In kitty, yoyomi uploads the page
-after the one you turn to once the turn is on screen. Inside tmux, measured
-the same way, a webtoon `j` takes about 0.3 s, and a page turn carries its
-image.
+In kitty, yoyomi uploads the page after the one you turn to once the turn
+is on screen. A webtoon `j` there glides for 0.28 s. Its frames are
+placements of a few dozen bytes, and the data is the band coming into
+reach, sent as raw pixels compressed with zlib. Sixel and half blocks draw
+one screen per `j`. Inside tmux a webtoon `j` takes about 55 ms and sends
+1.4 MiB, and a page turn carries its image.
 
 ## License
 
