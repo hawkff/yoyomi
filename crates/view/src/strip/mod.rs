@@ -128,6 +128,8 @@ struct View {
     /// Whether the last band kept was opaque. The next one likely is too,
     /// and the terminal stores three bytes a pixel of it, not four.
     opaque: bool,
+    /// Whether each band kept so far was opaque, by index.
+    opacity: HashMap<i64, bool>,
 }
 
 /// A kitty band: `band_rows` terminal rows of the strip as one image, which
@@ -272,6 +274,7 @@ impl Strip {
             bands: HashMap::new(),
             upward: false,
             opaque: false,
+            opacity: HashMap::new(),
         };
         view.clamp(&mut self.cx);
         view.origin = view.top;
@@ -718,7 +721,7 @@ impl View {
         if pieces.is_empty() {
             return None;
         }
-        let bytes = band_bytes(width, height, self.opaque);
+        let bytes = band_bytes(width, height, self.opacity.get(&index).copied().unwrap_or(self.opaque));
         if priority == Priority::Neighbor && !cx.resident.room(bytes) {
             return Some(bytes);
         }
@@ -891,14 +894,24 @@ impl View {
                         return update;
                     }
                     Ok((frame, errors, opaque)) => {
-                        // Under tmux a band goes out with the frames that draw it.
-                        if !cx.resident.resend() {
-                            update.uploads.extend(Upload::from_frame(&frame));
-                        }
                         if self.slides {
                             let (_, height) = self.band_span(index);
                             cx.resident.resize(lease, band_bytes(span.1, height, opaque));
                             self.opaque = opaque;
+                            self.opacity.insert(index, opaque);
+                            // A band around the viewport that counts more
+                            // than it was leased for and passes the budget
+                            // gives its room back unsent. From now on it is
+                            // leased for what it counts.
+                            if !self.band_ranges().0.contains(&index) && !cx.resident.room_to_come(0) {
+                                cx.resident.release(lease);
+                                self.bands.remove(&index);
+                                return update;
+                            }
+                        }
+                        // Under tmux a band goes out with the frames that draw it.
+                        if !cx.resident.resend() {
+                            update.uploads.extend(Upload::from_frame(&frame));
                         }
                         Band::Ready { lease, frame, errors, span }
                     }

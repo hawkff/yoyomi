@@ -641,6 +641,25 @@ fn bands_around_the_viewport_wait_for_room_in_the_budget() {
 }
 
 #[test]
+fn a_band_around_the_viewport_that_counts_more_than_its_lease_gives_way() {
+    // An opaque band of 80 x 160 pixels counts 38,400 bytes. The strip ends
+    // halfway down the band below, which keeps clear rows and counts 51,200:
+    // leased as opaque, it passes the budget once it is known.
+    let kitty = Recorder::sliding(CELL);
+    let resident = Resident::new(ImageIds::with_base(0x100), false).with_budget(80_000);
+    let mut h = harness_on(Pages::new(vec![rows_page(0, 80, 160), rows_page(1, 80, 80)]), kitty.clone(), resident);
+    assert!(h.show(0, 0.0, request(10, 10)).shown.is_some());
+    assert_eq!((h.view().bands.len(), kitty.renders()), (1, 2), "the band below rendered and gave way");
+    assert_eq!(h.resident.take_freed().len(), 1);
+    h.strip.room_freed();
+    h.settle(Update::default());
+    assert_eq!(kitty.renders(), 2, "it waits for the room it needs");
+    // In view it comes, room or not.
+    h.scroll(5.0);
+    h.band(1);
+}
+
+#[test]
 fn the_band_behind_gives_its_room_to_the_band_ahead() {
     // The budget holds three bands of 38,400 bytes; a viewport across two
     // bands wants four.
