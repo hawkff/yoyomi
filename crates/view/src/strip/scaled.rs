@@ -1,11 +1,13 @@
-//! Pages scaled to the strip width, and the strip images built from them.
+//! Pages scaled to the strip width in sections of rows, and the strip images
+//! built from them.
 
 use std::collections::{HashMap, VecDeque};
+use std::ops::Range;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 use yoyomi_core::{Book, Cancel, Error, PageCache, PageKind, Pixels, Result, RgbaImage, check_size};
-use yoyomi_render::{invert, rotate, scale};
+use yoyomi_render::{invert, scale_part};
 
 /// One page as the strip draws it: turned, scaled to `width` x `height` and
 /// maybe inverted.
@@ -18,16 +20,44 @@ pub(super) struct Key {
     pub invert: bool,
 }
 
-impl Key {
+/// Rows of a scaled page per section.
+pub(super) const SECTION_ROWS: u32 = 1024;
+
+/// Section `index` of the page `key` names: at most `SECTION_ROWS` of its
+/// scaled rows, from row `index * SECTION_ROWS` on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) struct Section {
+    pub key: Key,
+    pub index: u32,
+}
+
+impl Section {
+    /// The rows of the scaled page it holds.
+    fn rows(&self) -> Range<u32> {
+        let top = self.index * SECTION_ROWS;
+        top..top.saturating_add(SECTION_ROWS).min(self.key.height)
+    }
+
     fn pixels(&self) -> u64 {
-        u64::from(self.width) * u64::from(self.height)
+        let rows = self.rows();
+        u64::from(self.key.width) * u64::from(rows.end - rows.start)
     }
 }
 
-/// Scaled pages shared by the strip's jobs. Each page scales once per key:
-/// a job that needs a page another job is scaling waits for it, and shares
-/// its failure; a later request tries again. The most recently used pages
-/// stay within `MAX_PIXELS`.
+/// Rows of a scaled page: row 0 of `pixels` is row `top` of the page.
+#[derive(Clone)]
+pub(super) struct ScaledRows {
+    pub pixels: Pixels,
+    pub top: u32,
+    /// `pixels` is the whole page as decoded, which every section of the page
+    /// then holds.
+    pub whole: bool,
+}
+
+/// Scaled sections of pages shared by the strip's jobs. Each section scales
+/// once: a job that needs a section another job is scaling waits for it, and
+/// shares its failure; a later request tries again. The most recently used
+/// sections stay within `MAX_PIXELS`.
 #[derive(Default)]
 pub(super) struct ScaledPages {
     state: Mutex<State>,
@@ -35,41 +65,46 @@ pub(super) struct ScaledPages {
 
 #[derive(Default)]
 struct State {
-    /// A slot per key; jobs lock a slot while they fill it.
-    slots: HashMap<Key, Arc<Mutex<Option<Result<Pixels>>>>>,
-    /// Filled keys, least recently used first.
-    order: VecDeque<Key>,
+    /// A slot per section; jobs lock a slot while they fill it.
+    slots: HashMap<Section, Arc<Mutex<Option<Result<ScaledRows>>>>>,
+    /// Filled sections, least recently used first, each with whether it
+    /// holds its page whole.
+    order: VecDeque<(Section, bool)>,
+    /// How many kept sections hold each page whole. They share one
+    /// allocation, which counts once and in full.
+    whole: HashMap<Key, usize>,
     pixels: u64,
-    /// How many pages were scaled, for tests.
+    /// How many sections were scaled, for tests.
     scales: usize,
 }
 
 impl ScaledPages {
     pub const MAX_PIXELS: u64 = 64_000_000;
 
-    /// The page `key` names, scaled from `book` unless the cache holds it.
-    pub fn get(&self, book: &PageCache, key: Key, cancel: &Cancel) -> Result<Pixels> {
-        let slot = self.state.lock().slots.entry(key).or_default().clone();
+    /// The rows of `section`, scaled from `book` unless the cache holds them.
+    pub fn get(&self, book: &PageCache, section: Section, cancel: &Cancel) -> Result<ScaledRows> {
+        let slot = self.state.lock().slots.entry(section).or_default().clone();
         // Locks go slot first, then state, everywhere.
         let mut filled = slot.lock();
         match filled.as_ref() {
-            Some(Ok(pixels)) => {
-                self.state.lock().touch(key);
-                return Ok(pixels.clone());
+            Some(Ok(rows)) => {
+                self.state.lock().touch(section);
+                return Ok(rows.clone());
             }
             Some(Err(error)) => return Err(error.clone()),
             None => {}
         }
-        let result = scale_page(book, key, cancel);
+        let result = scale_section(book, section, cancel);
         let mut state = self.state.lock();
-        // A clear while the page scaled dropped the slot; the page stays out.
-        let kept = state.slots.get(&key).is_some_and(|kept| Arc::ptr_eq(kept, &slot));
+        // A clear while the section scaled dropped the slot; the section
+        // stays out.
+        let kept = state.slots.get(&section).is_some_and(|kept| Arc::ptr_eq(kept, &slot));
         match &result {
-            Ok(_) => {
+            Ok(rows) => {
                 state.scales += 1;
                 *filled = Some(result.clone());
                 if kept {
-                    state.insert(key);
+                    state.insert(section, rows.whole);
                 }
             }
             // A cancelled job leaves the slot empty for the next one.
@@ -79,7 +114,7 @@ impl ScaledPages {
             Err(_) => {
                 *filled = Some(result.clone());
                 if kept {
-                    state.slots.remove(&key);
+                    state.slots.remove(&section);
                 }
             }
         }
@@ -90,6 +125,7 @@ impl ScaledPages {
         let mut state = self.state.lock();
         state.slots.clear();
         state.order.clear();
+        state.whole.clear();
         state.pixels = 0;
     }
 
@@ -102,41 +138,67 @@ impl ScaledPages {
     pub fn kept(&self) -> usize {
         self.state.lock().order.len()
     }
+
+    #[cfg(test)]
+    pub fn pixels(&self) -> u64 {
+        self.state.lock().pixels
+    }
 }
 
 impl State {
-    fn touch(&mut self, key: Key) {
-        if let Some(i) = self.order.iter().position(|&kept| kept == key) {
-            self.order.remove(i);
-            self.order.push_back(key);
+    fn touch(&mut self, section: Section) {
+        if let Some(i) = self.order.iter().position(|&(kept, _)| kept == section)
+            && let Some(entry) = self.order.remove(i)
+        {
+            self.order.push_back(entry);
         }
     }
 
-    fn insert(&mut self, key: Key) {
-        self.pixels += key.pixels();
-        self.order.push_back(key);
-        // The newest page always stays.
+    fn insert(&mut self, section: Section, whole: bool) {
+        let page = u64::from(section.key.width) * u64::from(section.key.height);
+        // A page held whole keeps all of its pixels alive with its first
+        // section, and nothing more with the others.
+        self.pixels += match whole.then(|| self.whole.entry(section.key).or_insert(0)) {
+            Some(held) => {
+                *held += 1;
+                if *held == 1 { page } else { 0 }
+            }
+            None => section.pixels(),
+        };
+        self.order.push_back((section, whole));
+        // The newest section always stays.
         while self.pixels > ScaledPages::MAX_PIXELS && self.order.len() > 1 {
-            let Some(oldest) = self.order.pop_front() else { break };
+            let Some((oldest, whole)) = self.order.pop_front() else { break };
             self.slots.remove(&oldest);
-            self.pixels -= oldest.pixels();
+            self.pixels -= match whole.then(|| self.whole.get_mut(&oldest.key)).flatten() {
+                Some(held) if *held > 1 => {
+                    *held -= 1;
+                    0
+                }
+                Some(_) => {
+                    self.whole.remove(&oldest.key);
+                    u64::from(oldest.key.width) * u64::from(oldest.key.height)
+                }
+                None => oldest.pixels(),
+            };
         }
     }
 }
 
-/// Decodes, turns, scales and inverts one page, copying it only when one of
-/// those changes it.
-fn scale_page(book: &PageCache, key: Key, cancel: &Cancel) -> Result<Pixels> {
-    // Filling a wide viewport can enlarge a page far past its decoded size.
-    check_size(key.width, key.height)?;
+/// Decodes one page and turns, scales and inverts the rows of `section`. A
+/// page that none of those change comes whole, without a copy.
+fn scale_section(book: &PageCache, section: Section, cancel: &Cancel) -> Result<ScaledRows> {
+    let (key, rows) = (section.key, section.rows());
+    check_size(key.width, rows.end - rows.start)?;
     let page = book.page(key.page, cancel)?;
-    let turned = (key.quarter_turns & 3 != 0).then(|| rotate(&page, key.quarter_turns));
-    let source = turned.as_ref().unwrap_or(&page);
-    let mut changed = if source.dimensions() == (key.width, key.height) { turned } else { Some(scale(source, key.width, key.height)) };
-    if key.invert {
-        invert(changed.get_or_insert_with(|| RgbaImage::clone(&page)));
+    if key.quarter_turns & 3 == 0 && !key.invert && page.dimensions() == (key.width, key.height) {
+        return Ok(ScaledRows { pixels: page, top: 0, whole: true });
     }
-    Ok(changed.map_or(page, Arc::new))
+    let mut pixels = scale_part(&page, key.quarter_turns, (key.width, key.height), (0, rows.start, key.width, rows.end - rows.start));
+    if key.invert {
+        invert(&mut pixels);
+    }
+    Ok(ScaledRows { pixels: Arc::new(pixels), top: rows.start, whole: false })
 }
 
 /// One page in a strip image: its scaled pixels go with their top-left
@@ -165,11 +227,19 @@ pub(super) fn compose(
     }
     let mut image = RgbaImage::new(width, height);
     let mut errors = Vec::new();
-    for piece in pieces {
-        match scaled.get(book, piece.key, cancel) {
-            Ok(pixels) => paint(&mut image, &pixels, piece.x, piece.y),
-            Err(error) if error.is_cancelled() => return Err(error),
-            Err(error) => errors.push(format!("page {}: {error}", piece.key.page + 1)),
+    for &Piece { key, x, y } in pieces {
+        // Only the sections of the rows inside the image scale.
+        let rows = |at: i64| (at - y).clamp(0, i64::from(key.height)) as u32;
+        for index in rows(0) / SECTION_ROWS..rows(i64::from(height)).div_ceil(SECTION_ROWS) {
+            let section = Section { key, index };
+            match scaled.get(book, section, cancel) {
+                Ok(part) => paint(&mut image, &part, section.rows(), x, y),
+                Err(error) if error.is_cancelled() => return Err(error),
+                Err(error) => {
+                    errors.push(format!("page {}: {error}", key.page + 1));
+                    break;
+                }
+            }
         }
     }
     Ok((image, errors))
@@ -183,16 +253,17 @@ pub(super) const TEXT_NEEDS_PIXELS: &str = if cfg!(target_os = "macos") {
     "text pages in webtoon need pixel rendering: t to leave webtoon, e for browser, or a terminal with kitty or sixel graphics"
 };
 
-/// Copies the rows of `source` that fall inside `image`, with its top-left
-/// corner at `x`, `y`.
-fn paint(image: &mut RgbaImage, source: &RgbaImage, x: u32, y: i64) {
+/// Copies the page rows `rows` of `scaled` that fall inside `image`, with the
+/// page's top-left corner at `x`, `y`.
+fn paint(image: &mut RgbaImage, scaled: &ScaledRows, rows: Range<u32>, x: u32, y: i64) {
+    let source = &scaled.pixels;
     let (width, height) = (image.width() as usize, i64::from(image.height()));
     let (x, stride) = (x as usize, source.width() as usize * 4);
     let span = (source.width() as usize).min(width.saturating_sub(x)) * 4;
-    let (from, to) = (y.max(0), (y + i64::from(source.height())).min(height));
-    let (source, image) = (source.as_raw(), &mut **image);
+    let (from, to) = ((y + i64::from(rows.start)).max(0), (y + i64::from(rows.end)).min(height));
+    let (top, source, image) = (y + i64::from(scaled.top), source.as_raw(), &mut **image);
     for row in from..to {
-        let src = (row - y) as usize * stride;
+        let src = (row - top) as usize * stride;
         let dst = (row as usize * width + x) * 4;
         image[dst..dst + span].copy_from_slice(&source[src..src + span]);
     }

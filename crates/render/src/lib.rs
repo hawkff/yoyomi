@@ -10,6 +10,6 @@ mod terminal;
 
 pub use halfblock::HalfBlock;
 pub use kitty::{Kitty, MAX_CELLS, placeholder};
-pub use ops::{apply, crop_zoom, highlight, invert, rotate, scale};
+pub use ops::{apply, crop_zoom, highlight, invert, rotate, scale, scale_part};
 pub use sixel::Sixel;
 pub use terminal::{Terminal, cell_size, detect, needs_probe, probe};
