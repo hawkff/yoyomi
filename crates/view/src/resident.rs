@@ -53,6 +53,13 @@ impl State {
     fn held(&self) -> u64 {
         self.bytes.values().sum()
     }
+
+    /// The bytes of the images the terminal still holds once `take_freed`
+    /// returned the ids it may.
+    fn staying(&self) -> u64 {
+        let leaving = |id: &ImageId| self.freed.contains(id) && !self.pinned.contains(id) && !self.leases.contains_key(id);
+        self.bytes.iter().filter(|(id, _)| !leaving(id)).map(|(_, bytes)| bytes).sum()
+    }
 }
 
 impl Resident {
@@ -107,9 +114,8 @@ impl Resident {
     /// Takes leases away, least recently shown first, until what the
     /// terminal keeps once `take_freed` returns fits `budget`.
     fn make_room(&self, state: &mut State, budget: u64) {
+        let mut held = state.staying();
         let State { leases, order, pinned, freed, bytes, pinned_at, generation } = state;
-        let leaving = |id: &ImageId| !pinned.contains(id) && !leases.contains_key(id);
-        let mut held: u64 = bytes.iter().filter(|(id, _)| !(freed.contains(id) && leaving(id))).map(|(_, bytes)| bytes).sum();
         while held > budget {
             let may_go = |id: &ImageId| !pinned.contains(id) && leases[id] <= *pinned_at && leases[id] != *generation;
             let Some(oldest) = order.iter().position(may_go) else { break };
@@ -125,6 +131,12 @@ impl Resident {
     /// terminal holds now, without taking any away.
     pub fn room(&self, bytes: u64) -> bool {
         self.budget.is_none_or(|budget| self.state.lock().held() + bytes <= budget)
+    }
+
+    /// Whether an image of `bytes` fits the budget once the images whose
+    /// ids `take_freed` returns next left the terminal.
+    pub fn room_to_come(&self, bytes: u64) -> bool {
+        self.budget.is_none_or(|budget| self.state.lock().staying() + bytes <= budget)
     }
 
     /// A free id that is not pinned. The pinned ones it meets go back to the
@@ -184,6 +196,15 @@ impl Resident {
     /// Whether a lease holds `id`.
     pub fn leased(&self, id: ImageId) -> bool {
         self.state.lock().leases.contains_key(&id)
+    }
+
+    /// Counts `bytes` for the image of `lease`, once the terminal is known
+    /// to store another size than the lease was taken for.
+    pub fn resize(&self, lease: Lease, bytes: u64) {
+        let mut state = self.state.lock();
+        if state.leases.get(&lease.id) == Some(&lease.generation) {
+            state.bytes.insert(lease.id, bytes);
+        }
     }
 
     /// Marks the image of `lease` as shown now, so it goes last.
@@ -325,6 +346,21 @@ mod tests {
         let again = resident.lease(30);
         assert_eq!((again.id, resident.state.lock().held()), (first.id, 30));
         assert!(resident.take_freed().is_empty());
+    }
+
+    #[test]
+    fn a_lease_counts_the_bytes_it_was_resized_to() {
+        let resident = Resident::new(ImageIds::with_base(0x100), false).with_budget(10);
+        let (kept, gone) = (resident.lease(8), resident.lease(1));
+        assert!(!resident.room(2));
+        resident.resize(kept, 6);
+        assert!(resident.room(3) && !resident.room(4));
+        // A lease that ended keeps what it counted until its image leaves.
+        resident.release(gone);
+        resident.resize(gone, 0);
+        assert!(!resident.room(4) && resident.room_to_come(4) && !resident.room_to_come(5));
+        resident.pin([gone.id]);
+        assert!(!resident.room_to_come(4), "an image on screen stays");
     }
 
     #[test]

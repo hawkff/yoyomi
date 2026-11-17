@@ -122,6 +122,12 @@ struct View {
     origin: f64,
     band_rows: i64,
     bands: HashMap<i64, Band>,
+    /// Whether the last move went up: the bands above are then the ones the
+    /// next move reaches first.
+    upward: bool,
+    /// Whether the last band kept was opaque. The next one likely is too,
+    /// and the terminal stores three bytes a pixel of it, not four.
+    opaque: bool,
 }
 
 /// A kitty band: `band_rows` terminal rows of the strip as one image, which
@@ -147,12 +153,22 @@ impl Band {
     }
 }
 
+/// The bytes the terminal stores for a band of `width` by `height` pixels:
+/// three a pixel when `opaque`, as `Renderer::keep` sends it.
+fn band_bytes(width: u32, height: u32, opaque: bool) -> u64 {
+    (if opaque { 3 } else { 4 }) * u64::from(width) * u64::from(height)
+}
+
 /// A finished job of the strip.
 enum Done {
     Size { page: usize, result: Result<(u32, u32)> },
-    Band { generation: u64, index: i64, lease: Lease, span: (u32, u32), result: Result<(Frame, Vec<String>)> },
-    Frame { generation: u64, job: u64, page: usize, result: Result<(Frame, Vec<String>)> },
+    Band { generation: u64, index: i64, lease: Lease, span: (u32, u32), result: Result<Composed> },
+    Frame { generation: u64, job: u64, page: usize, result: Result<Composed> },
 }
+
+/// What a job composed: the frame, the pages that failed, and whether an
+/// image kept in the terminal is opaque.
+type Composed = (Frame, Vec<String>, bool);
 
 impl Strip {
     /// A strip for `book`. Its jobs run on `jobs` and report through
@@ -254,6 +270,8 @@ impl Strip {
             frame_job: 0,
             origin: 0.0,
             bands: HashMap::new(),
+            upward: false,
+            opaque: false,
         };
         view.clamp(&mut self.cx);
         view.origin = view.top;
@@ -387,6 +405,7 @@ impl Strip {
         if (view.top - before).abs() < 1e-9 {
             return Update::default();
         }
+        view.upward = view.top < before;
         if view.placeholders() {
             view.align(&self.cx.resident);
         }
@@ -607,12 +626,29 @@ impl View {
             }
             keep
         });
-        // The visible bands, then the ones below, which reading reaches first.
-        let (below, above) = (visible.end() + 1..=*wanted.end(), *wanted.start()..*visible.start());
-        for index in visible.clone().chain(below).chain(above) {
+        // The visible bands, then the ones ahead of the last move, which the
+        // next one reaches first, then the ones behind.
+        let (below, above) = (visible.end() + 1..wanted.end() + 1, *wanted.start()..*visible.start());
+        let (ahead, behind) = if self.upward { (above, below) } else { (below, above) };
+        let mut waiting = 0;
+        for index in visible.clone().chain(ahead) {
             if !self.bands.contains_key(&index) && self.covers_band(index) {
                 let priority = if visible.contains(&index) { Priority::Visible } else { Priority::Neighbor };
-                self.render_band(cx, index, priority);
+                waiting += self.render_band(cx, index, priority).unwrap_or(0);
+            }
+        }
+        // A band ahead waits for room in the image budget. Unless the images
+        // about to leave the terminal make it, the band behind gives its
+        // room up: a move the other way then waits for a band once, where a
+        // move on would wait at every band.
+        let short = waiting > 0 && !cx.resident.room_to_come(waiting);
+        for index in behind {
+            if short {
+                if let Some(band) = self.bands.remove(&index) {
+                    band.release(&cx.resident);
+                }
+            } else if !self.bands.contains_key(&index) && self.covers_band(index) {
+                self.render_band(cx, index, Priority::Neighbor);
             }
         }
     }
@@ -663,10 +699,10 @@ impl View {
     }
 
     /// Starts rendering band `index`, unless no page reaches into it or, for
-    /// a band around the viewport, the image budget has no room for it.
-    /// Where the strip slides, a band reaches from the leftmost pixel of its
-    /// pages to the rightmost.
-    fn render_band(&mut self, cx: &Context, index: i64, priority: Priority) {
+    /// a band around the viewport, the image budget has no room for it:
+    /// then it returns the bytes the band needs. Where the strip slides, a
+    /// band reaches from the leftmost pixel of its pages to the rightmost.
+    fn render_band(&mut self, cx: &Context, index: i64, priority: Priority) -> Option<u64> {
         let (y, height) = self.band_span(index);
         let mut pieces = self.pieces(&cx.book, y, height);
         let (mut left, mut width) = (0, self.width);
@@ -679,9 +715,12 @@ impl View {
                 piece.x -= left;
             }
         }
-        let bytes = 4 * u64::from(width) * u64::from(height);
-        if pieces.is_empty() || (priority == Priority::Neighbor && !cx.resident.room(bytes)) {
-            return;
+        if pieces.is_empty() {
+            return None;
+        }
+        let bytes = band_bytes(width, height, self.opaque);
+        if priority == Priority::Neighbor && !cx.resident.room(bytes) {
+            return Some(bytes);
         }
         let lease = cx.resident.lease(bytes);
         let cancel = Cancel::new();
@@ -690,6 +729,7 @@ impl View {
         let done = move |result| Done::Band { generation, index, lease, span: (left, width), result };
         cx.render(priority, &cancel, pieces, (width, height), lease.id, grid, done);
         self.bands.insert(index, Band::Rendering { lease, cancel });
+        None
     }
 
     /// Whether every visible band that holds pages is ready or failed.
@@ -850,10 +890,15 @@ impl View {
                         }
                         return update;
                     }
-                    Ok((frame, errors)) => {
+                    Ok((frame, errors, opaque)) => {
                         // Under tmux a band goes out with the frames that draw it.
                         if !cx.resident.resend() {
                             update.uploads.extend(Upload::from_frame(&frame));
+                        }
+                        if self.slides {
+                            let (_, height) = self.band_span(index);
+                            cx.resident.resize(lease, band_bytes(span.1, height, opaque));
+                            self.opaque = opaque;
                         }
                         Band::Ready { lease, frame, errors, span }
                     }
@@ -863,6 +908,11 @@ impl View {
                     }
                 };
                 self.bands.insert(index, band);
+                // A band that counts less than it was leased for leaves room
+                // for one that waited.
+                if self.slides {
+                    self.request_bands(cx);
+                }
                 if self.waiting && self.bands_ready() {
                     update.shown = Some(self.band_scene(cx, &mut update.uploads));
                 }
@@ -875,7 +925,7 @@ impl View {
                 self.frame = None;
                 self.waiting = false;
                 update.shown = Some(match result {
-                    Ok((frame, errors)) => Shown { page, scene: Scene { layers: vec![Layer::from_frame(&frame, At::default())] }, errors },
+                    Ok((frame, errors, _)) => Shown { page, scene: Scene { layers: vec![Layer::from_frame(&frame, At::default())] }, errors },
                     Err(error) => Shown { page, scene: Scene::default(), errors: vec![error.to_string()] },
                 });
             }
@@ -917,7 +967,7 @@ impl Context {
         (width, height): (u32, u32),
         id: ImageId,
         grid: Option<Grid>,
-        done: impl FnOnce(Result<(Frame, Vec<String>)>) -> Done + Send + 'static,
+        done: impl FnOnce(Result<Composed>) -> Done + Send + 'static,
     ) {
         let (book, scaled, renderer, events, source) =
             (self.book.clone(), self.scaled.clone(), self.renderer.clone(), self.events.clone(), self.source);
@@ -925,11 +975,10 @@ impl Context {
         let refuse_text = renderer.kind() == RendererKind::HalfBlock;
         self.jobs.spawn(priority, cancel, move || {
             let result = compose(&book, &scaled, &pieces, (width, height), refuse_text, &job_cancel).and_then(|(image, errors)| {
-                let frame = match grid {
-                    Some(grid) => renderer.render(&image, id, grid, false)?,
-                    None => renderer.keep(&image, id)?,
-                };
-                Ok((frame, errors))
+                Ok(match grid {
+                    Some(grid) => (renderer.render(&image, id, grid, false)?, errors, false),
+                    None => (renderer.keep(&image, id)?, errors, image.pixels().all(|pixel| pixel[3] == 255)),
+                })
             });
             // The app may have dropped the receiver while it shuts down.
             let _ = events.send(ViewEvent::new(source, done(result)));

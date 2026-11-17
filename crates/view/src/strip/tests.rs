@@ -620,9 +620,10 @@ fn a_sliding_glide_of_one_viewport_uploads_only_the_band_that_comes_into_reach()
 
 #[test]
 fn bands_around_the_viewport_wait_for_room_in_the_budget() {
-    // Bands of 80 x 160 pixels count 51,200 bytes; the budget holds two and
-    // a half.
-    let resident = Resident::new(ImageIds::with_base(0x100), false).with_budget(128_000);
+    // Bands of 80 x 160 opaque pixels count 38,400 bytes once kept, and
+    // 51,200 until the first one of a view is; the budget holds two and a
+    // half.
+    let resident = Resident::new(ImageIds::with_base(0x100), false).with_budget(100_000);
     let mut h = harness_on(Pages::new((0..20).map(|i| rows_page(i, 80, 400)).collect()), Recorder::sliding(CELL), resident);
     h.show(0, 0.0, request(10, 10));
     let old = h.band(0);
@@ -637,6 +638,51 @@ fn bands_around_the_viewport_wait_for_room_in_the_budget() {
     h.settle(Update::default());
     h.band(1);
     assert!(!h.view().bands.contains_key(&-1), "the band below comes first and fills the budget");
+}
+
+#[test]
+fn the_band_behind_gives_its_room_to_the_band_ahead() {
+    // The budget holds three bands of 38,400 bytes; a viewport across two
+    // bands wants four.
+    let resident = Resident::new(ImageIds::with_base(0x100), false).with_budget(120_000);
+    let mut h = harness_on(Pages::new((0..20).map(|i| rows_page(i, 80, 400)).collect()), Recorder::sliding(CELL), resident);
+    h.show(5, 0.0, request(10, 10));
+    let held = |h: &Harness| {
+        let mut held: Vec<i64> = h.view().bands.keys().copied().collect();
+        held.sort_unstable();
+        held
+    };
+    assert_eq!(held(&h), [-1, 0, 1], "one band in view and the two around it fit");
+    // The terminal lets go of an image once the app took its freed id.
+    let free = |h: &mut Harness| {
+        assert_eq!(h.resident.take_freed().len(), 1);
+        h.strip.room_freed();
+        h.settle(Update::default());
+    };
+    h.scroll(5.0);
+    assert_eq!(held(&h), [0, 1], "moving down, the band above leaves for the one below");
+    free(&mut h);
+    assert_eq!(held(&h), [0, 1, 2]);
+    h.band(2);
+    h.scroll(-1.0);
+    assert_eq!(held(&h), [0, 1], "moving up, the band below leaves for the one above");
+    free(&mut h);
+    assert_eq!(held(&h), [-1, 0, 1]);
+    h.band(-1);
+
+    // A budget of four bands holds the band behind: the band ahead waits
+    // only until the band that left the view left the terminal.
+    let resident = Resident::new(ImageIds::with_base(0x100), false).with_budget(160_000);
+    let mut h = harness_on(Pages::new((0..20).map(|i| rows_page(i, 80, 400)).collect()), Recorder::sliding(CELL), resident);
+    h.show(5, 0.0, request(10, 10));
+    h.scroll(5.0);
+    assert_eq!(held(&h), [-1, 0, 1, 2]);
+    let behind = h.band(0);
+    h.scroll(10.0);
+    assert_eq!(held(&h), [0, 1, 2]);
+    free(&mut h);
+    assert_eq!(held(&h), [0, 1, 2, 3]);
+    assert_eq!(h.band(0), behind, "the band behind stayed");
 }
 
 #[test]
