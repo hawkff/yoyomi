@@ -7,9 +7,9 @@ use crossbeam_channel::{Receiver, unbounded};
 use parking_lot::Mutex;
 use yoyomi_core::image::Rgba;
 use yoyomi_core::{CellSize, Error, ImageIds, PageKind, Pixels, RgbaImage, fit_box};
-use yoyomi_render::{HalfBlock, Kitty};
+use yoyomi_render::{HalfBlock, Kitty, invert, rotate, scale};
 
-use super::scaled::TEXT_NEEDS_PIXELS;
+use super::scaled::{SECTION_ROWS, Section, TEXT_NEEDS_PIXELS};
 use super::*;
 
 const CELL: CellSize = CellSize { w: 8.0, h: 16.0 };
@@ -103,6 +103,21 @@ impl Book for Pages {
 /// rows, as testdata/webtoon.cbz has.
 fn rows_page(page: usize, width: u32, height: u32) -> RgbaImage {
     RgbaImage::from_fn(width, height, |_, y| Rgba([page as u8, (y % 256) as u8, 0, 255]))
+}
+
+/// A page whose every row and column has its own color.
+fn varied_page(width: u32, height: u32) -> RgbaImage {
+    RgbaImage::from_fn(width, height, |x, y| Rgba([(x * 13 + y) as u8, (y * 7 + x) as u8, (x * 5 + y * 3) as u8, 255]))
+}
+
+/// Checks that row `y` of `got` matches row `want_y` of `want` to within one
+/// level per channel.
+fn assert_row_near(got: &RgbaImage, y: u32, want: &RgbaImage, want_y: u32, what: &str) {
+    assert_eq!(got.width(), want.width(), "{what}");
+    for x in 0..got.width() {
+        let (a, b) = (pixel(got, x, y), pixel(want, x, want_y));
+        assert!(a.iter().zip(b).all(|(&a, b)| a.abs_diff(b) <= 1), "{what}: pixel {x},{y} is {a:?}, want {b:?}");
+    }
 }
 
 fn solid(width: u32, height: u32, color: [u8; 4]) -> RgbaImage {
@@ -557,14 +572,99 @@ fn fill_scales_every_page_to_the_viewport_width() {
 }
 
 #[test]
-fn a_page_that_fill_would_enlarge_past_the_pixel_limit_reports_it() {
-    // 10 x 40,000 pixels at 1,000 wide would take 1,000 x 4,000,000.
+fn a_page_filled_far_past_the_viewport_scales_only_the_sections_in_view() {
+    // 10 x 40,000 pixels at 1,000 wide take 1,000 x 4,000,000.
     let sixel = Recorder::new(RendererKind::Sixel, PIXEL);
-    let mut h = harness(Pages::new(vec![solid(10, 40_000, RED)]), sixel.clone(), false);
-    let shown = h.show(0, 0.0, StripRequest { fill: true, ..request(1000, 100) }).shown.expect("a frame");
-    assert_eq!(shown.errors.len(), 1, "{:?}", shown.errors);
-    assert!(shown.errors[0].starts_with("page 1: page exceeds"), "{:?}", shown.errors);
-    assert_eq!(pixel(&sixel.last(), 500, 50), CLEAR, "the page's place stays empty");
+    let mut h = harness(Pages::new(vec![rows_page(0, 10, 40_000)]), sixel.clone(), false);
+    let scaled = h.strip.cx.scaled.clone();
+    for (offset, scales) in [(0.0, 1), (0.5, 2)] {
+        let shown = h.show(0, offset, StripRequest { fill: true, ..request(1000, 100) }).shown.expect("a frame");
+        assert!(shown.errors.is_empty(), "{:?}", shown.errors);
+        assert_eq!(scaled.scales(), scales, "the viewport lies in one section");
+    }
+    assert_eq!(scaled.pixels(), 2 * 1000 * u64::from(SECTION_ROWS));
+    // Row 2,000,050 of the strip shows row 20,000 of the page.
+    assert_eq!(pixel(&sixel.last(), 500, 50), [0, (20_000 % 256) as u8, 0, 255]);
+}
+
+#[test]
+fn a_section_holds_the_rows_of_the_page_scaled_whole() {
+    // Enlarging and shrinking, turned every way and inverted; every page
+    // spans a join of sections.
+    let cases = [
+        ((30, 700), 0, (90, 2100), false),
+        ((200, 5000), 0, (50, 1250), false),
+        ((700, 30), 1, (90, 2100), false),
+        ((5000, 200), 3, (50, 1250), false),
+        ((60, 1000), 2, (75, 1250), true),
+    ];
+    for ((page_w, page_h), quarter_turns, (width, height), invert_page) in cases {
+        assert!(height > SECTION_ROWS);
+        let page = varied_page(page_w, page_h);
+        let book = PageCache::new(Pages::new(vec![page.clone()]));
+        let scaled = ScaledPages::default();
+        let key = Key { page: 0, quarter_turns, width, height, invert: invert_page };
+        let mut whole = scale(&rotate(&page, quarter_turns), width, height);
+        if invert_page {
+            invert(&mut whole);
+        }
+        let mut next = 0;
+        for index in 0..height.div_ceil(SECTION_ROWS) {
+            let part = scaled.get(&book, Section { key, index }, &Cancel::new()).expect("a section");
+            assert_eq!(part.top, next);
+            for y in 0..part.pixels.height() {
+                assert_row_near(&part.pixels, y, &whole, next, &format!("{key:?} section {index} row {y}"));
+                next += 1;
+            }
+        }
+        assert_eq!(next, height);
+    }
+
+    // A page at its own size comes straight from the page cache.
+    let book = Pages::new(vec![varied_page(60, 3000)]);
+    let key = Key { page: 0, quarter_turns: 0, width: 60, height: 3000, invert: false };
+    let part = ScaledPages::default().get(&PageCache::new(book.clone()), Section { key, index: 2 }, &Cancel::new()).expect("a section");
+    assert!(Arc::ptr_eq(&part.pixels, &book.pages[0]) && part.top == 0);
+}
+
+#[test]
+fn a_frame_across_a_section_join_and_a_page_join_shows_every_row_once() {
+    // Filled to 120 wide, page 0 grows to three times its height, past the
+    // end of its first section.
+    let pages = vec![varied_page(40, SECTION_ROWS / 3 + 30), varied_page(40, 300)];
+    let whole: Vec<RgbaImage> = pages.iter().map(|page| scale(page, 120, page.height() * 3)).collect();
+    let sixel = Recorder::new(RendererKind::Sixel, PIXEL);
+    let mut h = harness(Pages::new(pages), sixel.clone(), false);
+    h.show(0, 0.0, StripRequest { fill: true, ..request(120, 300) });
+    let top = SECTION_ROWS - 100;
+    h.scroll(f64::from(top));
+    let frame = sixel.last();
+    assert!(whole[0].height() > SECTION_ROWS && whole[0].height() < top + 300, "the frame spans both joins");
+    for y in 0..300 {
+        let row = top + y;
+        let (page, page_row) = if row < whole[0].height() { (0, row) } else { (1, row - whole[0].height()) };
+        assert_row_near(&frame, y, &whole[page], page_row, &format!("frame row {y}"));
+    }
+}
+
+#[test]
+fn scrolling_a_long_strip_keeps_its_sections_within_the_budget() {
+    // Filled to 1,000 wide, every page grows to 20 whole sections, and the
+    // strip to more pixels than the budget.
+    let pages = (0..4).map(|i| rows_page(i, 100, 2 * SECTION_ROWS)).collect();
+    let sixel = Recorder::new(RendererKind::Sixel, PIXEL);
+    let mut h = harness(Pages::new(pages), sixel, false);
+    h.show(0, 0.0, StripRequest { fill: true, ..request(1000, 100) });
+    let scaled = h.strip.cx.scaled.clone();
+    assert!(80 * 1000 * u64::from(SECTION_ROWS) > ScaledPages::MAX_PIXELS);
+    // A section at a time, each frame inside one.
+    for _ in 1..80 {
+        h.scroll(f64::from(SECTION_ROWS));
+        assert!(scaled.pixels() <= ScaledPages::MAX_PIXELS, "{} pixels", scaled.pixels());
+    }
+    assert_position(&h, 3, 19.0 / 20.0);
+    assert_eq!(scaled.scales(), 80, "every section scaled once");
+    assert!(scaled.kept() < 80, "the least recently used sections went");
 }
 
 #[test]
