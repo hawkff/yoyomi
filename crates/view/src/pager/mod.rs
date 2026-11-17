@@ -62,6 +62,9 @@ pub struct Pager {
     delivered: bool,
     /// The pages of `request` that failed, with their messages.
     failed: HashMap<FrameKey, String>,
+    /// The pages ahead of `request` that found no room in the image budget
+    /// once and render again.
+    refused: Vec<FrameKey>,
     frames: Vec<Cached>,
     /// The jobs whose results still count, by the frame they render.
     running: HashMap<FrameKey, Running>,
@@ -123,7 +126,9 @@ impl Slot {
 struct Rendered {
     job: u64,
     key: FrameKey,
-    result: Result<Frame>,
+    /// No frame when the image budget had no room for a page rendered
+    /// ahead.
+    result: Result<Option<Frame>>,
     claim: Claim,
 }
 
@@ -157,6 +162,7 @@ impl Pager {
             request: None,
             delivered: false,
             failed: HashMap::new(),
+            refused: Vec::new(),
             frames: Vec::new(),
             running: HashMap::new(),
             next_job: 0,
@@ -188,6 +194,7 @@ impl Pager {
         self.request = Some(request);
         self.delivered = false;
         self.failed.clear();
+        self.refused.clear();
         let mut update = Update::default();
         self.advance(&mut update);
         update
@@ -206,8 +213,19 @@ impl Pager {
         match result {
             // Another frame took the id while this one rendered; its upload
             // would replace that frame's image.
-            Ok(_) if claim.lease.is_some_and(|lease| !self.resident.holds(lease)) => self.start(key, priority),
-            Ok(frame) => {
+            Ok(Some(_)) if claim.lease.is_some_and(|lease| !self.resident.holds(lease)) => self.start(key, priority),
+            // The image budget had no room for a page ahead. Its job may
+            // have asked before the frame it follows was pinned on screen,
+            // while the frame before still counted, so it asks once more.
+            // A page that shows by now renders below, room or not.
+            Ok(None) => {
+                let shows = self.request.as_ref().is_some_and(|request| self.slots(request).iter().any(|slot| slot.key == key));
+                if !shows && !self.refused.contains(&key) {
+                    self.refused.push(key.clone());
+                    self.start(key, Priority::Neighbor);
+                }
+            }
+            Ok(Some(frame)) => {
                 let lease = claim.lease.take();
                 let upload = Upload::from_frame(&frame);
                 // Under tmux the upload goes out with every show of the frame.
@@ -243,6 +261,7 @@ impl Pager {
         }
         self.request = None;
         self.failed.clear();
+        self.refused.clear();
     }
 
     /// The slots of `request`: one page fills the body; in a spread the left
@@ -440,7 +459,7 @@ impl Pager {
         self.jobs.spawn(priority, &cancel.clone(), move || {
             started.store(true, Ordering::SeqCst);
             let mut claim = Claim { lease: None, resident };
-            let result = render(&book, renderer.as_ref(), &mut claim, &key, &cancel);
+            let result = render(&book, renderer.as_ref(), &mut claim, &key, &cancel, priority == Priority::Neighbor);
             // A closed channel drops the event, and its claim gives the id back.
             let _ = events.send(ViewEvent::new(source, Rendered { job, key, result, claim }));
         });
@@ -455,19 +474,24 @@ impl Drop for Pager {
 
 /// Decodes, transforms and renders one frame. Kitty frames take a lease
 /// into `claim` right before rendering, so cancelled work holds no id, for
-/// the four bytes a pixel of the bitmap kitty fits to the frame's cells.
-fn render(book: &PageCache, renderer: &dyn Renderer, claim: &mut Claim, key: &FrameKey, cancel: &Cancel) -> Result<Frame> {
+/// the four bytes a pixel of the bitmap kitty fits to the frame's cells. A
+/// page rendered `ahead` gives no frame when the image budget has no room
+/// for it.
+fn render(book: &PageCache, renderer: &dyn Renderer, claim: &mut Claim, key: &FrameKey, cancel: &Cancel, ahead: bool) -> Result<Option<Frame>> {
     let pixels = book.page(key.page, cancel)?;
     let (image, invert) = yoyomi_render::apply(&pixels, &key.transform);
     cancel.check()?;
-    let lease = (renderer.kind() == RendererKind::Kitty).then(|| {
+    if renderer.kind() == RendererKind::Kitty {
         let cell = renderer.cell_size();
         let grid = fit_box(image.width(), image.height(), Grid::new(key.max.cols.min(MAX_CELLS), key.max.rows.min(MAX_CELLS)), cell).grid;
         let side = |cells: u16, size: f64| (f64::from(cells) * size).round() as u64;
-        claim.resident.lease(4 * side(grid.cols, cell.w) * side(grid.rows, cell.h))
-    });
-    claim.lease = lease;
-    renderer.render(&image, lease.map_or(ImageId(0), |lease| lease.id), key.max, invert)
+        let bytes = 4 * side(grid.cols, cell.w) * side(grid.rows, cell.h);
+        claim.lease = if ahead { claim.resident.lease_ahead(bytes) } else { Some(claim.resident.lease(bytes)) };
+        if claim.lease.is_none() {
+            return Ok(None);
+        }
+    }
+    renderer.render(&image, claim.lease.map_or(ImageId(0), |lease| lease.id), key.max, invert).map(Some)
 }
 
 /// The page a turn by `delta` from `page` leads to: a spread moves two pages,

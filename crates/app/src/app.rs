@@ -2585,6 +2585,10 @@ pub(crate) mod tests {
             self.left.retain(|id, _| !drawn.contains(id));
             // Until the frame ends the old one shows, after it the new one.
             for (part, on_screen) in [(&out[..end], &self.shown), (&out[end..], &drawn)] {
+                if std::ptr::eq(on_screen, &drawn) {
+                    let missing: Vec<&u32> = drawn.iter().filter(|id| !self.images.contains_key(id)).collect();
+                    assert!(missing.is_empty(), "the frame draws images the terminal lacks: {missing:?}");
+                }
                 for (id, upload) in kitty_acts(part) {
                     assert!(!on_screen.contains(&id), "image {id} changes on screen: {out:?}");
                     if let Some((kept, bytes)) = upload {

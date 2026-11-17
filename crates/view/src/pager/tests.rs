@@ -490,6 +490,66 @@ fn neighbors_stop_before_they_push_the_shown_pages_out() {
     assert!(rig.pager.book.cached(2).is_some() && rig.pager.book.cached(3).is_some(), "the shown pages stay decoded");
 }
 
+/// `rig` with a pager that keeps its images within `tenths` tenths of the
+/// bytes of a page.
+fn within(mut rig: Rig, tenths: u64) -> Rig {
+    let cell = CellSize::FALLBACK;
+    let grid = fit_box(rig.book.size.0, rig.book.size.1, Grid::new(21, 10), cell).grid;
+    let page = 4 * (f64::from(grid.cols) * cell.w).round() as u64 * (f64::from(grid.rows) * cell.h).round() as u64;
+    let resident = Arc::new(Resident::new(ImageIds::with_base(0x100), false).with_budget(page * tenths / 10));
+    let (sender, events) = crossbeam_channel::unbounded();
+    rig.pager = Pager::new(Arc::new(PageCache::new(rig.book.clone())), rig.renderer.clone(), Jobs::new(2), resident.clone(), sender);
+    (rig.resident, rig.events) = (resident, events);
+    rig
+}
+
+#[test]
+fn a_page_ahead_renders_when_the_budget_has_room_once_older_pages_went() {
+    // The budget holds two and a half pages: the page on screen and the next.
+    let mut rig = within(rig_with(RendererKind::Kitty, 6, false, None, Some(2), (1, 1)), 25);
+    rig.pager.show(request(0, false));
+    let first = kitty_id(&shown(rig.settle()));
+    assert_eq!(rig.renders_of(&[1]), 1, "page 2 readies");
+    // The app pins what a frame draws and collects the freed ids. Page 3
+    // decodes until the pin is in.
+    rig.resident.pin([first]);
+    let second = kitty_id(&rig.pager.show(request(1, false)).shown.expect("page 2 is ready"));
+    rig.resident.pin([second]);
+    rig.book.released.store(true, Ordering::SeqCst);
+    rig.settle();
+    assert_eq!(rig.renders_of(&[2]), 1, "page 3 readies past the budget");
+    assert_eq!(rig.resident.take_freed(), [first], "and page 1 leaves for it");
+}
+
+#[test]
+fn a_page_ahead_waits_for_room_and_renders_once_it_shows() {
+    // The budget holds one and a half pages, so no page readies ahead.
+    let mut rig = within(rig_with(RendererKind::Kitty, 6, false, None, Some(2), (1, 1)), 15);
+    rig.pager.show(request(0, false));
+    let first = kitty_id(&shown(rig.settle()));
+    assert_eq!(rig.renders_of(&[1]), 0, "page 2 has no room");
+    rig.resident.pin([first]);
+    rig.pager.show(request(1, false));
+    let event = rig.events.recv_timeout(Duration::from_secs(5)).expect("page 2 rendered");
+    let second = kitty_id(&rig.pager.on_event(event).expect("the pager's own event").shown.expect("page 2 shows"));
+    rig.resident.pin([second]);
+    // Page 3 started as the page ahead and still decodes when it shows.
+    rig.wait_holding();
+    assert!(rig.pager.show(request(2, false)).shown.is_none());
+    assert_eq!(rig.running(2).priority, Priority::Neighbor);
+    rig.book.released.store(true, Ordering::SeqCst);
+    assert_eq!(shown(rig.settle()).page, 2);
+    assert_eq!(rig.renders_of(&[2]), 1, "page 3 rendered once it showed");
+}
+
+/// The kitty id of the one page `shown` draws.
+fn kitty_id(shown: &Shown) -> ImageId {
+    match shown.scene.layers[..] {
+        [Layer::KittyRows { id, .. }] => id,
+        _ => panic!("not one kitty page: {:?}", shown.scene.layers),
+    }
+}
+
 #[test]
 fn a_queued_neighbor_that_shows_gives_way_to_a_visible_job() {
     let mut rig = rig(RendererKind::Sixel, 5, false);
