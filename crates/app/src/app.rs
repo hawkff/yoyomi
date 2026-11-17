@@ -16,7 +16,7 @@ use yoyomi_core::{
 use yoyomi_formats::{Opened, TextFormat};
 use yoyomi_render::{Terminal, cell_size};
 use yoyomi_search::{Progress, Search};
-use yoyomi_state::{BookKey, Bookmarks, Position, Positions};
+use yoyomi_state::{BookKey, Bookmarks, Position, Positions, Settings};
 use yoyomi_view::{PageRequest, Pager, Resident, Shown, Strip, StripPosition, StripRequest, Update, ViewEvent};
 use yoyomi_web::Server;
 
@@ -29,6 +29,8 @@ use crate::shot;
 
 const ZOOM_STEP: f64 = 1.25;
 const ZOOM_MAX: f64 = 8.0;
+/// Milliseconds `+` and `-` add to or take from the glide.
+const GLIDE_STEP_MS: i16 = 40;
 const FRAME_TIME: Duration = Duration::from_nanos(1_000_000_000 / 120);
 /// Multiplexers can settle the window geometry after the first resize event.
 const SETTLE_TIME: Duration = Duration::from_millis(300);
@@ -188,6 +190,7 @@ pub struct App {
     resident: Arc<Resident>,
     positions: Positions,
     pub bookmarks: Bookmarks,
+    pub settings: Settings,
     events: Sender<Event>,
     view_events: Sender<ViewEvent>,
     pub cols: u16,
@@ -243,8 +246,8 @@ pub struct App {
 }
 
 impl App {
-    /// A reader for a screen of `cols` x `rows` cells. Its bookmarks stay in
-    /// memory until the caller sets the stored ones.
+    /// A reader for a screen of `cols` x `rows` cells. Its bookmarks and
+    /// settings stay in memory until the caller sets the stored ones.
     pub fn new(
         renderer: Arc<dyn Renderer>,
         probed: Terminal,
@@ -261,6 +264,7 @@ impl App {
             resident,
             positions,
             bookmarks: Bookmarks::load_from(None),
+            settings: Settings::load_from(None),
             events,
             view_events,
             cols,
@@ -345,7 +349,8 @@ impl App {
     fn opened(&mut self, i: usize, book: Arc<dyn Book>, page: Option<usize>) {
         let book = Arc::new(PageCache::new(book));
         let pager = Pager::new(book.clone(), self.renderer.clone(), self.jobs.clone(), self.resident.clone(), self.view_events.clone());
-        let strip = Strip::new(book.clone(), self.renderer.clone(), self.jobs.clone(), self.resident.clone(), self.view_events.clone());
+        let mut strip = Strip::new(book.clone(), self.renderer.clone(), self.jobs.clone(), self.resident.clone(), self.view_events.clone());
+        strip.set_glide(self.glide());
         let select = Select::new(book.clone(), self.jobs.clone(), self.events.clone());
         let (searched, events) = (book.clone(), self.events.clone());
         let search = Search::new(book.inner().clone(), self.jobs.clone(), move |progress| {
@@ -472,7 +477,7 @@ impl App {
         {
             self.last_tick = now;
             let before = reader.strip.position();
-            let update = reader.strip.tick();
+            let update = reader.strip.tick(now);
             // A tick that moved nothing, as at an end of the strip, leaves
             // the pane as it was.
             if update.shown.is_some() || reader.strip.position() != before {
@@ -862,6 +867,8 @@ impl App {
             "tab" => self.open_chapters(),
             "i" => self.change(|pane| pane.invert = !pane.invert),
             "R" => self.change(|pane| pane.quarter_turns = (pane.quarter_turns + 1) & 3),
+            "+" | "=" if self.webtoon => self.glide_by(GLIDE_STEP_MS),
+            "-" if self.webtoon => self.glide_by(-GLIDE_STEP_MS),
             "+" | "=" => self.zoom_by(ZOOM_STEP),
             "-" => self.zoom_by(1.0 / ZOOM_STEP),
             "0" => self.change(Pane::reset_view),
@@ -980,15 +987,32 @@ impl App {
         }
     }
 
+    /// `+` and `-` in webtoon and theater mode: a glide `step` milliseconds
+    /// longer, within 0 and `Settings::MAX_GLIDE_MS`, for every strip. The
+    /// status bar shows it after the mode.
+    fn glide_by(&mut self, step: i16) {
+        if !self.slides() {
+            self.status = "this terminal moves the page in jumps".to_owned();
+            return;
+        }
+        self.settings.glide_ms = self.settings.glide_ms.saturating_add_signed(step).min(Settings::MAX_GLIDE_MS);
+        let glide = self.glide();
+        for reader in self.panes.iter_mut().filter_map(|pane| pane.reader.as_mut()) {
+            reader.strip.set_glide(glide);
+        }
+    }
+
+    /// How long a move of the strip takes where it slides.
+    fn glide(&self) -> Duration {
+        Duration::from_millis(self.settings.glide_ms.into())
+    }
+
+    /// Whether the active pane's strip can move the picture by a pixel.
+    fn slides(&self) -> bool {
+        self.panes[self.active].reader.as_ref().is_some_and(|reader| reader.strip.slides())
+    }
+
     fn zoom_by(&mut self, factor: f64) {
-        if self.theater {
-            self.status = "theater mode fills the viewport width".to_owned();
-            return;
-        }
-        if self.webtoon {
-            self.status = "webtoon mode fits pages to the viewport width".to_owned();
-            return;
-        }
         self.change(|pane| {
             pane.zoom = (pane.zoom * factor).clamp(1.0, ZOOM_MAX);
             if pane.zoom <= 1.001 {
@@ -1589,6 +1613,12 @@ impl App {
         let mut left = format!(" {}", self.renderer.kind().name());
         if self.webtoon {
             left = format!("{left}  ·  {}", self.strip_mode().0);
+            if self.slides() {
+                left = match self.settings.glide_ms {
+                    0 => format!("{left}  ·  glide off"),
+                    ms => format!("{left}  ·  glide {ms} ms"),
+                };
+            }
         }
         let search = self.search().and_then(|(_, search)| search::progress(search)).unwrap_or_default();
         let port = self.web.port().map(|port| format!(":{port}")).unwrap_or_default();
@@ -1605,14 +1635,16 @@ impl App {
 
     // ---- leaving -----------------------------------------------------------------
 
-    /// Saves or forgets the positions as `quit` asks, closes the books and
-    /// returns what went wrong with the saved positions.
+    /// Saves or forgets the positions as `quit` asks, saves changed settings,
+    /// closes the books and returns what went wrong with the saved positions
+    /// or else with the settings.
     pub fn finish(&mut self) -> Option<String> {
         self.web.close();
+        let settings = self.settings.save().err().map(|error| format!("save settings: {error}"));
         let native = self.native_save.take().zip(self.panes[self.active].reader.as_ref().map(|reader| reader.key.clone()));
         let readers: Vec<(Reader, usize)> = self.panes.iter_mut().filter_map(|pane| Some((pane.reader.take()?, pane.page))).collect();
         if readers.is_empty() {
-            return None;
+            return settings;
         }
         for (reader, page) in &readers {
             let key = &reader.key;
@@ -1636,7 +1668,7 @@ impl App {
         };
         drop(readers);
         self.jobs.shutdown();
-        result
+        result.or(settings)
     }
 }
 
@@ -1806,7 +1838,7 @@ pub(crate) mod tests {
         assert_eq!((app.panes[0].zoom, app.panes[0].center), (1.0, (0.5, 0.5)));
         keys(&mut app, "t+");
         assert_eq!(app.panes[0].zoom, 1.0);
-        assert!(app.status_left().contains("webtoon mode fits pages"));
+        assert!(app.status_left().ends_with("webtoon  ·  this terminal moves the page in jumps"), "{}", app.status_left());
     }
 
     #[test]
@@ -2421,13 +2453,14 @@ pub(crate) mod tests {
             ("s", "spread is unavailable in theater mode (T to leave)"),
             ("v", "split is unavailable in theater mode (T to leave)"),
             ("O", "split is unavailable in theater mode (T to leave)"),
-            ("+", "theater mode fills the viewport width"),
-            ("-", "theater mode fills the viewport width"),
+            ("+", "this terminal moves the page in jumps"),
+            ("-", "this terminal moves the page in jumps"),
         ] {
             keys(&mut app, key);
             assert!(app.status_left().ends_with(want), "{key}: {}", app.status_left());
         }
         assert!(app.theater && !app.spread && !app.split && app.pick_for.is_none() && app.panes[0].zoom == 1.0);
+        assert_eq!(app.settings.glide_ms, Settings::GLIDE_MS);
 
         let (mut app, _) = app_with(Arc::new(HalfBlock::new(CellSize::FALLBACK)), 80, 24);
         app.split = true;
@@ -2459,6 +2492,86 @@ pub(crate) mod tests {
                 assert_near(strip_place(&app).0, StripPosition { page: 2, offset: 0.5 }, "the restore");
             }
         }
+    }
+
+    /// Half blocks that say they draw pixels, so the strip slides.
+    struct Sliding(HalfBlock);
+
+    impl Renderer for Sliding {
+        fn kind(&self) -> RendererKind {
+            RendererKind::Native
+        }
+        fn cell_size(&self) -> CellSize {
+            self.0.cell_size()
+        }
+        fn set_cell_size(&self, cell: CellSize) {
+            self.0.set_cell_size(cell);
+        }
+        fn render(&self, image: &RgbaImage, id: yoyomi_core::ImageId, max: Grid, invert: bool) -> Result<yoyomi_core::Frame> {
+            self.0.render(image, id, max, invert)
+        }
+        fn delete(&self, id: yoyomi_core::ImageId) -> Vec<u8> {
+            self.0.delete(id)
+        }
+    }
+
+    /// An 80 x 24 reader whose strip slides, on a book of 5 pages, and the
+    /// receiver of its view jobs.
+    fn sliding_reader() -> (App, Receiver<ViewEvent>) {
+        let (events, _) = unbounded();
+        let (view_events, views) = unbounded();
+        let resident = Arc::new(Resident::new(ImageIds::with_base(0x100), false));
+        let renderer = Arc::new(Sliding(HalfBlock::new(CellSize::FALLBACK)));
+        let mut app = App::new(renderer, Terminal::default(), resident, Positions::load_from(None), events, view_events, (80, 24));
+        deliver(&mut app, 0, "/books/a.cbz", Ok(fake(5, "/books/a.cbz")));
+        (app, views)
+    }
+
+    #[test]
+    fn plus_and_minus_set_the_glide_in_both_strip_modes() {
+        let (mut app, _views) = sliding_reader();
+        let status = |app: &mut App, pressed: &str| {
+            keys(app, pressed);
+            app.status_left()
+        };
+        assert_eq!(status(&mut app, "t"), " native  ·  webtoon  ·  glide 280 ms");
+        assert_eq!(status(&mut app, "+"), " native  ·  webtoon  ·  glide 320 ms", "the glide shows once");
+        assert_eq!(status(&mut app, "="), " native  ·  webtoon  ·  glide 360 ms");
+        assert_eq!(status(&mut app, &"-".repeat(10)), " native  ·  webtoon  ·  glide off");
+        assert_eq!(status(&mut app, &"+".repeat(20)), " native  ·  webtoon  ·  glide 600 ms");
+        assert_eq!(status(&mut app, "T-"), " native  ·  theater  ·  glide 560 ms");
+        assert_eq!((app.settings.glide_ms, app.panes[0].zoom), (560, 1.0));
+        // Pages zoom.
+        assert_eq!(status(&mut app, "T+"), " native");
+        assert_eq!((app.settings.glide_ms, app.panes[0].zoom), (560, ZOOM_STEP));
+    }
+
+    #[test]
+    fn a_changed_glide_is_saved_on_q_and_on_big_q() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        for (quit, pressed, want) in [("q", "t+", 320), ("Q", "t++", 400)] {
+            let (mut app, _views) = sliding_reader();
+            app.settings = Settings::load_from(Some(path.clone()));
+            keys(&mut app, pressed);
+            keys(&mut app, quit);
+            assert_eq!(app.finish(), None);
+            assert_eq!(Settings::load_from(Some(path.clone())).glide_ms, want, "{quit}");
+        }
+    }
+
+    #[test]
+    fn a_strip_opened_after_a_change_glides_for_the_new_time() {
+        let (mut app, views) = sliding_reader();
+        keys(&mut app, "T");
+        keys(&mut app, &"-".repeat(7));
+        assert!(app.status_left().ends_with("glide off"), "{}", app.status_left());
+        deliver(&mut app, 0, "/books/b.cbz", Ok(fake(5, "/books/b.cbz")));
+        run_views(&mut app, &views, |app| app.shown(0).is_some() && app.deadline().is_none());
+        let strip = &mut app.panes[0].reader.as_mut().expect("an open book").strip;
+        strip.scroll(1.0);
+        strip.tick(Instant::now());
+        assert_eq!(strip.pending(), 0.0, "a glide of 0 moves in one tick");
     }
 
     // ---- panes ---------------------------------------------------------------

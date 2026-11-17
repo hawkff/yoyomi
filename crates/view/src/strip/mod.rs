@@ -10,6 +10,7 @@ mod tests;
 use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use yoyomi_core::{At, Book, Cancel, Error, Frame, Grid, ImageId, Jobs, Layer, PageCache, Priority, Renderer, RendererKind, Result, Scene, Upload};
@@ -55,6 +56,10 @@ pub struct Strip {
     /// blank when their image is uploaded again under the same id and the
     /// cells stay unchanged, so a render never reuses an id the screen shows.
     retired: Vec<Lease>,
+    /// How long a move takes where the strip slides.
+    glide: Duration,
+    /// A `shift` waits: the next tick runs all of the pending rows.
+    shifted: bool,
 }
 
 /// What the strip shares with its jobs.
@@ -81,8 +86,6 @@ struct View {
     request: StripRequest,
     generation: u64,
     kitty: bool,
-    /// Pixels for a native window, which eases with a velocity.
-    native: bool,
     cols: u16,
     rows: u16,
     /// Strip pixels per terminal row.
@@ -98,9 +101,12 @@ struct View {
     pending: f64,
     /// Kitty: the fraction of a row the last scroll could not show.
     carry: f64,
-    /// Native windows: the rows the last frame moved, which the next one
-    /// builds on.
-    velocity: f64,
+    /// The glide under way: the time of its first tick, the top it starts
+    /// from and the strip pixels it moves.
+    gliding: Option<(Instant, f64, f64)>,
+    /// The time of the last tick of a glide. A move during the glide starts
+    /// the next one there, so the view moves on through the key press.
+    glided: Option<Instant>,
     /// The viewport waits for page sizes or its frame; scrolling holds until
     /// they arrive.
     waiting: bool,
@@ -150,7 +156,35 @@ impl Strip {
         let scaled = Arc::new(ScaledPages::default());
         let (sizes, sizing, sizing_cancel) = (HashMap::new(), HashSet::new(), Cancel::new());
         let cx = Context { source: next_source(), book, renderer, jobs, resident, events, scaled, sizes, sizing, sizing_cancel };
-        Strip { cx, generation: 0, anchor: None, view: None, retired: Vec::new() }
+        Strip { cx, generation: 0, anchor: None, view: None, retired: Vec::new(), glide: Strip::GLIDE, shifted: false }
+    }
+
+    /// How long a move takes unless `set_glide` says otherwise.
+    pub const GLIDE: Duration = Duration::from_millis(280);
+
+    /// A move starts its glide at the last tick of the glide before it when
+    /// that tick is at most this old.
+    const RESUME: Duration = Duration::from_millis(50);
+
+    /// The most rows a move keeps: more than any strip has, and few enough
+    /// that their pixels stay far inside the integers the bands count in.
+    const MAX_MOVE: f64 = 1e12;
+
+    /// Sets how long a move takes where the strip slides, for this view and
+    /// later ones. Zero moves at once. A glide under way goes on from where
+    /// the view is, over the new time.
+    pub fn set_glide(&mut self, glide: Duration) {
+        if glide != self.glide
+            && let Some(view) = &mut self.view
+        {
+            view.gliding = None;
+        }
+        self.glide = glide;
+    }
+
+    /// Whether the renderer can move the picture by a pixel, so moves glide.
+    pub fn slides(&self) -> bool {
+        self.cx.renderer.kind() == RendererKind::Native
     }
 
     /// Shows the strip from `at` with `request`, anchoring it at that page.
@@ -196,7 +230,6 @@ impl Strip {
             request,
             generation: self.generation,
             kitty,
-            native: renderer.kind() == RendererKind::Native,
             cols,
             rows,
             cell_h,
@@ -207,7 +240,8 @@ impl Strip {
             top: at.offset * f64::from(size.1),
             pending,
             carry,
-            velocity: 0.0,
+            gliding: None,
+            glided: None,
             waiting: false,
             frame: None,
             frame_job: 0,
@@ -231,9 +265,9 @@ impl Strip {
         update
     }
 
-    /// Adds `rows` terminal rows to the scrolling still to run; `tick` eases
-    /// toward it. Before the anchor page's size arrives, the rows wait for
-    /// the view.
+    /// Adds `rows` terminal rows to the scrolling still to run, which `tick`
+    /// runs. Before the anchor page's size arrives, the rows wait for the
+    /// view.
     pub fn scroll(&mut self, rows: f64) {
         if !rows.is_finite() {
             return;
@@ -241,17 +275,29 @@ impl Strip {
         // Turning around drops what was left of the other direction.
         match (&mut self.view, &mut self.anchor) {
             (Some(view), _) => {
-                if view.pending * rows < 0.0 || view.velocity * rows < 0.0 {
+                if view.pending * rows < 0.0 {
                     view.pending = 0.0;
-                    view.velocity = 0.0;
                 }
-                view.pending += rows + std::mem::take(&mut view.carry);
+                view.pending = (view.pending + rows + std::mem::take(&mut view.carry)).clamp(-Strip::MAX_MOVE, Strip::MAX_MOVE);
+                // The next tick starts the glide again from where the view is.
+                view.gliding = None;
             }
             (None, Some((_, _, pending, carry))) => {
-                *pending = if *pending * rows < 0.0 { rows } else { *pending + rows } + std::mem::take(carry);
+                let rows = if *pending * rows < 0.0 { rows } else { *pending + rows } + std::mem::take(carry);
+                *pending = rows.clamp(-Strip::MAX_MOVE, Strip::MAX_MOVE);
             }
             (None, None) => {}
         }
+    }
+
+    /// Scrolls `rows` as `scroll` does, but the next tick runs all of the
+    /// scrolling still to run, also where the strip glides.
+    pub fn shift(&mut self, rows: f64) {
+        if !rows.is_finite() {
+            return;
+        }
+        self.scroll(rows);
+        self.shifted = self.pending() != 0.0;
     }
 
     /// Kitty: the fraction of a row the last scroll could not show, which
@@ -283,47 +329,49 @@ impl Strip {
         }
     }
 
-    /// Runs one frame of eased scrolling.
-    pub fn tick(&mut self) -> Update {
+    /// Moves the view for the time `now`: where the strip slides, along a
+    /// glide that eases out over the glide time. It starts at the first tick
+    /// after a move, or at the last tick of the glide the move came during.
+    /// Elsewhere, or with a glide time of zero, all of the scrolling still to
+    /// run moves at once.
+    pub fn tick(&mut self, now: Instant) -> Update {
+        let glides = self.slides() && !self.glide.is_zero();
         let Some(view) = &mut self.view else { return Update::default() };
         if view.waiting || view.pending == 0.0 {
             return Update::default();
         }
-        let pending = view.pending;
-        let rows = if view.native {
-            // The native window eases: the velocity follows the distance
-            // left, at most 64 pixels a frame, and never overshoots.
-            view.velocity = (view.velocity + pending * 0.075) * 0.8;
-            let step = view.velocity.clamp(-64.0, 64.0);
-            if step.abs() > pending.abs() { pending } else { step }
-        } else if view.kitty {
-            // Placeholder cells move in whole rows.
-            let rows = (pending * 0.3).round().clamp(-3.0, 3.0);
-            if rows == 0.0 { pending.round() } else { rows }
-        } else if pending.abs() < 0.02 {
-            pending
-        } else {
-            (pending * 0.3).clamp(-3.0, 3.0)
-        };
-        view.pending -= rows;
-        // Half a row left would round to a whole row each way and never stop;
-        // the next scroll takes it, so two half viewports make a whole one.
-        if view.kitty && view.pending.abs() <= 0.5 {
-            view.carry = view.pending;
-            view.pending = 0.0;
-        }
-        if view.native && view.pending.abs() < 0.05 {
-            view.pending = 0.0;
-            view.velocity = 0.0;
-        }
         let before = view.top;
-        let target = before + rows * view.cell_h;
+        let target = if glides && !std::mem::take(&mut self.shifted) {
+            // An older tick, as before a wait for a band, would make the
+            // new glide leap.
+            let began = view.glided.filter(|&last| now.saturating_duration_since(last) <= Strip::RESUME).unwrap_or(now);
+            let (start, from, distance) = *view.gliding.get_or_insert((began, before, view.pending * view.cell_h));
+            let u = (now.saturating_duration_since(start).as_secs_f64() / self.glide.as_secs_f64()).min(1.0);
+            let target = from + distance * (1.0 - (1.0 - u).powi(3));
+            view.pending = (from + distance - target) / view.cell_h;
+            view.glided = Some(now);
+            if u == 1.0 {
+                view.pending = 0.0;
+                view.stop_glide();
+            }
+            target
+        } else {
+            self.shifted = false;
+            // Placeholder cells move in whole rows. The half row left would
+            // round to a whole row each way; the next scroll takes it, so two
+            // half viewports make a whole one.
+            let rows = if view.kitty { view.pending.round() } else { view.pending };
+            view.carry = view.pending - rows;
+            view.pending = 0.0;
+            view.stop_glide();
+            before + rows * view.cell_h
+        };
         view.top = target;
         view.clamp(&mut self.cx);
         if (view.top - target).abs() > 1e-9 {
             // An end of the strip stops the scrolling.
             view.pending = 0.0;
-            view.velocity = 0.0;
+            view.stop_glide();
         }
         // At an end, clamped or landed on, there is no half row to keep.
         if view.at_end() {
@@ -339,7 +387,7 @@ impl Strip {
         self.release_retired(update)
     }
 
-    /// Whether scrolling still eases, so the app keeps calling `tick`.
+    /// Whether scrolling still runs, so the app keeps calling `tick`.
     pub fn moving(&self) -> bool {
         self.view.as_ref().is_some_and(|view| view.pending != 0.0)
     }
@@ -396,6 +444,7 @@ impl Strip {
     /// not load ask again in the next view.
     fn drop_view(&mut self) {
         self.anchor = None;
+        self.shifted = false;
         self.cx.sizes.retain(|_, size| size.is_some());
         if let Some(view) = self.view.take() {
             if let Some(cancel) = view.frame {
@@ -435,6 +484,12 @@ fn scaled_size(size: Option<(u32, u32)>, request: &StripRequest, unit: f64, widt
 }
 
 impl View {
+    /// Ends the glide under way, so the next move starts from rest.
+    fn stop_glide(&mut self) {
+        self.gliding = None;
+        self.glided = None;
+    }
+
     /// Places the pages that strip rows `y0..y1` cover, as far as their sizes
     /// are known; the others start size jobs.
     fn reach(&mut self, cx: &mut Context, y0: f64, y1: f64) {
@@ -661,7 +716,7 @@ impl View {
         if moved {
             // An end of the strip turned up inside the viewport.
             self.pending = 0.0;
-            self.velocity = 0.0;
+            self.stop_glide();
             self.carry = 0.0;
             if self.kitty {
                 self.align(&cx.resident);

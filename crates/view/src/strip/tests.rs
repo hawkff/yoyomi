@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, unbounded};
 use parking_lot::Mutex;
@@ -210,17 +210,25 @@ impl Harness {
             || self.strip.view.as_ref().is_some_and(|view| view.waiting || view.bands.values().any(|band| matches!(band, Band::Rendering { .. })))
     }
 
-    /// Scrolls `rows` and eases until the scrolling stops, settling every
-    /// frame. Returns the update of every frame.
+    /// Scrolls `rows` and ticks every 10 ms of a made-up clock until the
+    /// scrolling stops, settling every frame. Returns the update of every
+    /// frame.
     fn scroll(&mut self, rows: f64) -> Vec<Update> {
         self.strip.scroll(rows);
+        let start = Instant::now();
         let mut frames = Vec::new();
         while self.strip.moving() {
-            let update = self.strip.tick();
+            let update = self.strip.tick(start + Duration::from_millis(10) * frames.len() as u32);
             frames.push(self.settle(update));
-            assert!(frames.len() < 1000, "the easing stops");
+            assert!(frames.len() < 1000, "the scrolling stops");
         }
         frames
+    }
+
+    /// Runs the tick at `now` and settles its frame.
+    fn tick(&mut self, now: Instant) {
+        let update = self.strip.tick(now);
+        self.settle(update);
     }
 
     fn view(&self) -> &View {
@@ -313,9 +321,11 @@ fn a_page_scales_once_per_width_and_turn() {
     let kitty = Recorder::new(RendererKind::Kitty, CELL);
     let mut h = harness(book.clone(), kitty.clone(), false);
     h.show(0, 0.0, request(10, 10));
+    // A viewport at a time, so every band on the way renders.
     for _ in 0..2 {
-        h.scroll(60.0);
-        h.scroll(-60.0);
+        for rows in [10.0; 6].into_iter().chain([-10.0; 6]) {
+            h.scroll(rows);
+        }
     }
     let scaled = h.strip.cx.scaled.clone();
     assert!(scaled.kept() > PageCache::MAX_PAGES);
@@ -415,11 +425,11 @@ fn kitty_bands_fill_their_cells_exactly() {
             if !h.strip.moving() {
                 break;
             }
-            let update = h.strip.tick();
+            let update = h.strip.tick(Instant::now());
             let update = h.settle(update);
             assert_rows_map_into_bands(&h, &update, grid);
         }
-        assert!(!h.strip.moving(), "the easing stops");
+        assert!(!h.strip.moving(), "the scrolling stops");
     }
 }
 
@@ -702,38 +712,154 @@ fn show_then_position_returns_that_position() {
     }
 }
 
+/// A native strip of one page 100 pixels wide and `height` tall, in a
+/// viewport of 100 x 80 pixels.
+fn native(height: u32) -> Harness {
+    let mut h = harness(Pages::new(vec![rows_page(0, 100, height)]), Recorder::new(RendererKind::Native, PIXEL), false);
+    h.show(0, 0.0, request(100, 80));
+    h
+}
+
+fn ms(ms: u64) -> Duration {
+    Duration::from_millis(ms)
+}
+
 #[test]
-fn easing_reaches_the_pending_amount_and_stops() {
-    for (kind, cell) in [(RendererKind::Sixel, PIXEL), (RendererKind::Kitty, CELL)] {
-        let mut h = harness(Pages::new(vec![rows_page(0, 80, 2000)]), Recorder::new(kind, cell), false);
-        h.show(0, 0.0, request(10, 10));
-        h.strip.scroll(10.0);
-        let mut tops = vec![0.0];
-        while h.strip.moving() {
-            let update = h.strip.tick();
-            h.settle(update);
-            tops.push(h.view().top);
-            assert!(tops.len() < 40, "the easing stops");
-        }
-        let rows: Vec<f64> = tops.windows(2).map(|step| (step[1] - step[0]) / cell.h).collect();
-        assert!(rows.iter().all(|&step| step > 0.0 && step <= 3.0 + 1e-9), "steps of {rows:?}");
-        if kind == RendererKind::Kitty {
-            assert!(rows.iter().all(|step| step.fract() == 0.0), "kitty moves in whole rows: {rows:?}");
-        }
-        assert!((tops.last().unwrap() - 10.0 * cell.h).abs() < 1e-9);
-
-        // Turning around drops what was left of the other direction.
-        h.strip.scroll(10.0);
-        h.strip.tick();
-        h.strip.scroll(-1.0);
-        assert_eq!(h.view().pending, -1.0);
+fn a_glide_eases_out_and_ends_on_its_target() {
+    let mut h = native(10_000);
+    let start = Instant::now();
+    h.strip.scroll(1000.0);
+    h.tick(start);
+    assert_eq!((h.view().top, h.strip.pending()), (0.0, 1000.0), "the clock starts at the first tick");
+    for (elapsed, u) in [(70, 0.25), (140, 0.5)] {
+        h.tick(start + ms(elapsed));
+        let (top, want) = (h.view().top, 1000.0 * (1.0 - (1.0_f64 - u).powi(3)));
+        assert!((top - want).abs() < 1e-6, "after {elapsed} ms: {top}, want {want}");
+        assert!((h.strip.pending() - (1000.0 - top)).abs() < 1e-6 && h.strip.moving());
     }
-
-    // Kitty rounds a half row of scrolling to whole rows and stops.
-    let mut h = harness(Pages::new(vec![rows_page(0, 80, 2000)]), Recorder::new(RendererKind::Kitty, CELL), false);
-    h.show(0, 0.0, request(10, 10));
-    h.scroll(49.5);
+    h.tick(start + Strip::GLIDE);
+    assert_eq!((h.view().top, h.strip.pending()), (1000.0, 0.0));
     assert!(!h.strip.moving());
+}
+
+#[test]
+fn a_move_during_a_glide_goes_on_from_where_the_view_is() {
+    let mut h = native(10_000);
+    let start = Instant::now();
+    h.strip.scroll(1000.0);
+    h.tick(start);
+    h.tick(start + ms(140));
+    let mut tops = vec![h.view().top];
+    assert!((tops[0] - 875.0).abs() < 1e-6, "{tops:?}");
+    h.strip.scroll(500.0);
+    for elapsed in [150, 200, 290, 430] {
+        h.tick(start + ms(elapsed));
+        tops.push(h.view().top);
+    }
+    // The new glide starts at the last tick, 10 ms before, with the 625
+    // pixels now left to run.
+    let want = 875.0 + 625.0 * (1.0 - (1.0 - 10.0 / 280.0_f64).powi(3));
+    assert!((tops[1] - want).abs() < 1e-6, "the view moves on through the key press: {tops:?}");
+    assert!(tops.windows(2).all(|pair| pair[1] > pair[0]), "no jump back and no pause: {tops:?}");
+    assert!((tops[4] - 1500.0).abs() < 1e-9, "the glide ends at the sum of both moves: {tops:?}");
+    assert!(!h.strip.moving());
+
+    // A move after the glide ended starts from rest, at its first tick.
+    h.strip.scroll(100.0);
+    h.tick(start + ms(500));
+    assert_eq!(h.view().top, tops[4]);
+    h.tick(start + ms(640));
+    // Turning around drops what was left of the other direction.
+    h.strip.scroll(-1.0);
+    assert_eq!(h.strip.pending(), -1.0);
+}
+
+#[test]
+fn without_a_glide_or_a_renderer_that_slides_a_move_takes_one_tick() {
+    let moves = [
+        (RendererKind::Native, Duration::ZERO),
+        (RendererKind::Kitty, Strip::GLIDE),
+        (RendererKind::Sixel, Strip::GLIDE),
+        (RendererKind::HalfBlock, Strip::GLIDE),
+    ];
+    for (kind, glide) in moves {
+        let mut h = harness(Pages::new(vec![rows_page(0, 80, 2000)]), Recorder::new(kind, CELL), false);
+        assert_eq!(h.strip.slides(), kind == RendererKind::Native);
+        h.show(0, 0.0, request(10, 10));
+        h.strip.set_glide(glide);
+        h.strip.scroll(10.0);
+        h.tick(Instant::now());
+        assert!(!h.strip.moving(), "{kind:?}");
+        assert_eq!(h.view().top, 10.0 * h.view().cell_h, "{kind:?}");
+    }
+}
+
+#[test]
+fn an_end_of_the_strip_stops_a_glide() {
+    let mut h = native(1000);
+    let start = Instant::now();
+    h.strip.scroll(5000.0);
+    h.tick(start);
+    h.tick(start + ms(140));
+    assert_eq!((h.view().top, h.strip.pending()), (920.0, 0.0));
+    assert!(!h.strip.moving());
+}
+
+#[test]
+fn a_shift_moves_at_once_and_ends_a_glide_at_the_sum() {
+    let mut h = native(10_000);
+    let start = Instant::now();
+    h.strip.shift(100.0);
+    h.tick(start);
+    assert_eq!((h.view().top, h.strip.pending()), (100.0, 0.0));
+    h.strip.scroll(1000.0);
+    h.tick(start + ms(10));
+    assert_eq!(h.view().top, 100.0, "a scroll after a shift glides");
+    h.tick(start + ms(150));
+    assert!(h.view().top > 100.0 && h.strip.moving());
+    h.strip.shift(50.0);
+    h.tick(start + ms(160));
+    assert!((h.view().top - 1150.0).abs() < 1e-9, "{}", h.view().top);
+    assert!(!h.strip.moving());
+}
+
+#[test]
+fn a_changed_glide_time_and_an_empty_shift_leave_a_glide_moving_on() {
+    let mut h = native(10_000);
+    let start = Instant::now();
+    h.strip.scroll(1000.0);
+    h.tick(start);
+    h.tick(start + ms(140));
+    assert!((h.view().top - 875.0).abs() < 1e-6);
+    // The 125 pixels left now take 320 ms from the last tick.
+    h.strip.set_glide(ms(320));
+    h.tick(start + ms(150));
+    let want = 875.0 + 125.0 * (1.0 - (1.0 - 10.0 / 320.0_f64).powi(3));
+    assert!((h.view().top - want).abs() < 1e-6, "{}", h.view().top);
+    for rows in [f64::NAN, f64::INFINITY] {
+        h.strip.shift(rows);
+    }
+    h.tick(start + ms(160));
+    assert!(h.view().top > want && h.view().top < 1000.0 && h.strip.moving(), "{}", h.view().top);
+    h.tick(start + ms(460));
+    assert_eq!((h.view().top, h.strip.moving()), (1000.0, false));
+}
+
+#[test]
+fn a_move_longer_than_any_strip_lands_at_its_end() {
+    // Five pages of 480 rows, of which a 10 x 10 viewport shows 160.
+    let mut h = harness(Pages::new((0..5).map(|i| rows_page(i, 80, 480)).collect()), Recorder::new(RendererKind::Kitty, CELL), false);
+    h.show(0, 0.0, request(10, 10));
+    for rows in [1e18, f64::MAX] {
+        h.strip.scroll(rows);
+        // The sizes of the pages on the way arrive after the move.
+        h.tick(Instant::now());
+        assert_position(&h, 4, 320.0 / 480.0);
+        assert!(!h.strip.moving());
+    }
+    h.strip.scroll(-f64::MAX);
+    h.tick(Instant::now());
+    assert_position(&h, 0, 0.0);
 }
 
 #[test]
@@ -809,36 +935,6 @@ fn kitty_drops_the_half_row_on_landing_at_an_end() {
     assert_eq!(top_after(&[36.0, 4.5, -9.0]), 32.0);
     assert_eq!(top_after(&[5.0, -4.5]), 0.0, "half a viewport lands on the top");
     assert_eq!(top_after(&[5.0, -4.5, 9.0]), 9.0);
-}
-
-#[test]
-fn native_scrolling_eases_with_a_velocity_of_at_most_64_pixels() {
-    let mut h = harness(Pages::new(vec![rows_page(0, 100, 10_000)]), Recorder::new(RendererKind::Native, PIXEL), false);
-    h.show(0, 0.0, request(100, 80));
-    h.strip.scroll(100.0);
-    let update = h.strip.tick();
-    h.settle(update);
-    // The first frame moves (0 + 100 * 0.075) * 0.8 pixels.
-    assert_position(&h, 0, 6.0 / 10_000.0);
-    h.scroll(0.0);
-    let top = h.view().top;
-    assert!((top - 100.0).abs() < 0.05, "the easing ends at its target: {top}");
-
-    h.strip.scroll(2000.0);
-    let mut steps = Vec::new();
-    while h.strip.moving() {
-        let before = h.view().top;
-        let update = h.strip.tick();
-        h.settle(update);
-        steps.push(h.view().top - before);
-    }
-    assert!(steps.iter().all(|step| *step <= 64.0 + 1e-9) && steps.iter().any(|step| (step - 64.0).abs() < 1e-6), "{steps:?}");
-
-    // Turning around drops the velocity with the distance left.
-    h.strip.scroll(100.0);
-    h.strip.tick();
-    h.strip.scroll(-1.0);
-    assert_eq!((h.view().pending, h.view().velocity), (-1.0, 0.0));
 }
 
 #[test]

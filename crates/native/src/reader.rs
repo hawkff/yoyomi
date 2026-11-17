@@ -143,15 +143,20 @@ impl Reader {
         self.apply(update, webtoon);
     }
 
-    /// Whether webtoon scrolling still eases, so `tick` should run again.
+    /// Whether webtoon scrolling still runs, so `tick` should run again.
     pub fn moving(&self) -> bool {
         self.state.webtoon && self.strip.moving()
     }
 
-    /// Runs one frame of eased webtoon scrolling.
+    /// Runs one frame of webtoon scrolling.
     pub fn tick(&mut self) {
+        self.tick_at(Instant::now());
+    }
+
+    /// Runs the frame of webtoon scrolling for the time `now`.
+    fn tick_at(&mut self, now: Instant) {
         if self.state.webtoon {
-            let update = self.strip.tick();
+            let update = self.strip.tick(now);
             self.apply(update, true);
         }
     }
