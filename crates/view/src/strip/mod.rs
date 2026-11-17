@@ -166,9 +166,19 @@ impl Strip {
     /// that tick is at most this old.
     const RESUME: Duration = Duration::from_millis(50);
 
+    /// The most rows a move keeps: more than any strip has, and few enough
+    /// that their pixels stay far inside the integers the bands count in.
+    const MAX_MOVE: f64 = 1e12;
+
     /// Sets how long a move takes where the strip slides, for this view and
-    /// later ones. Zero moves at once.
+    /// later ones. Zero moves at once. A glide under way goes on from where
+    /// the view is, over the new time.
     pub fn set_glide(&mut self, glide: Duration) {
+        if glide != self.glide
+            && let Some(view) = &mut self.view
+        {
+            view.gliding = None;
+        }
         self.glide = glide;
     }
 
@@ -268,12 +278,13 @@ impl Strip {
                 if view.pending * rows < 0.0 {
                     view.pending = 0.0;
                 }
-                view.pending += rows + std::mem::take(&mut view.carry);
+                view.pending = (view.pending + rows + std::mem::take(&mut view.carry)).clamp(-Strip::MAX_MOVE, Strip::MAX_MOVE);
                 // The next tick starts the glide again from where the view is.
                 view.gliding = None;
             }
             (None, Some((_, _, pending, carry))) => {
-                *pending = if *pending * rows < 0.0 { rows } else { *pending + rows } + std::mem::take(carry);
+                let rows = if *pending * rows < 0.0 { rows } else { *pending + rows } + std::mem::take(carry);
+                *pending = rows.clamp(-Strip::MAX_MOVE, Strip::MAX_MOVE);
             }
             (None, None) => {}
         }
@@ -282,6 +293,9 @@ impl Strip {
     /// Scrolls `rows` as `scroll` does, but the next tick runs all of the
     /// scrolling still to run, also where the strip glides.
     pub fn shift(&mut self, rows: f64) {
+        if !rows.is_finite() {
+            return;
+        }
         self.scroll(rows);
         self.shifted = self.pending() != 0.0;
     }

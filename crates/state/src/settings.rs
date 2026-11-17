@@ -19,10 +19,11 @@ pub struct Settings {
     saved: u16,
 }
 
-/// The contents of `settings.json`.
+/// The contents of `settings.json`. The glide reads as wide as JSON numbers
+/// go, so a value far over the longest glide still loads, bounded.
 #[derive(Serialize, Deserialize)]
 struct SettingsFile {
-    glide_ms: u16,
+    glide_ms: u64,
 }
 
 fn read(path: &Path) -> Option<SettingsFile> {
@@ -44,7 +45,7 @@ impl Settings {
     /// Reads settings from `path`; `None` keeps them in memory only. A glide
     /// over `MAX_GLIDE_MS` loads as `MAX_GLIDE_MS`.
     pub fn load_from(path: Option<PathBuf>) -> Self {
-        let glide_ms = path.as_deref().and_then(read).map_or(Self::GLIDE_MS, |file| file.glide_ms.min(Self::MAX_GLIDE_MS));
+        let glide_ms = path.as_deref().and_then(read).map_or(Self::GLIDE_MS, |file| file.glide_ms.min(Self::MAX_GLIDE_MS.into()) as u16);
         Settings { glide_ms, path, saved: glide_ms }
     }
 
@@ -54,7 +55,7 @@ impl Settings {
         if self.glide_ms == self.saved {
             return Ok(());
         }
-        let file = SettingsFile { glide_ms: self.glide_ms };
+        let file = SettingsFile { glide_ms: self.glide_ms.into() };
         storage::update(path, |_| serde_json::to_vec_pretty(&file).map_err(|error| Error::Format(error.to_string())))?;
         self.saved = self.glide_ms;
         Ok(())
@@ -92,7 +93,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         assert_eq!(Settings::load_from(Some(path.clone())).glide_ms, Settings::GLIDE_MS);
-        for (text, glide_ms) in [("{not json", Settings::GLIDE_MS), (r#"{"glide_ms": -40}"#, Settings::GLIDE_MS), (r#"{"glide_ms": 900}"#, 600)] {
+        for (text, glide_ms) in [
+            ("{not json", Settings::GLIDE_MS),
+            (r#"{"glide_ms": -40}"#, Settings::GLIDE_MS),
+            (r#"{"glide_ms": 900}"#, 600),
+            (r#"{"glide_ms": 70000}"#, 600),
+        ] {
             fs::write(&path, text).unwrap();
             assert_eq!(Settings::load_from(Some(path.clone())).glide_ms, glide_ms, "{text}");
         }

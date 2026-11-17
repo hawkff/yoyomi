@@ -824,6 +824,45 @@ fn a_shift_moves_at_once_and_ends_a_glide_at_the_sum() {
 }
 
 #[test]
+fn a_changed_glide_time_and_an_empty_shift_leave_a_glide_moving_on() {
+    let mut h = native(10_000);
+    let start = Instant::now();
+    h.strip.scroll(1000.0);
+    h.tick(start);
+    h.tick(start + ms(140));
+    assert!((h.view().top - 875.0).abs() < 1e-6);
+    // The 125 pixels left now take 320 ms from the last tick.
+    h.strip.set_glide(ms(320));
+    h.tick(start + ms(150));
+    let want = 875.0 + 125.0 * (1.0 - (1.0 - 10.0 / 320.0_f64).powi(3));
+    assert!((h.view().top - want).abs() < 1e-6, "{}", h.view().top);
+    for rows in [f64::NAN, f64::INFINITY] {
+        h.strip.shift(rows);
+    }
+    h.tick(start + ms(160));
+    assert!(h.view().top > want && h.view().top < 1000.0 && h.strip.moving(), "{}", h.view().top);
+    h.tick(start + ms(460));
+    assert_eq!((h.view().top, h.strip.moving()), (1000.0, false));
+}
+
+#[test]
+fn a_move_longer_than_any_strip_lands_at_its_end() {
+    // Five pages of 480 rows, of which a 10 x 10 viewport shows 160.
+    let mut h = harness(Pages::new((0..5).map(|i| rows_page(i, 80, 480)).collect()), Recorder::new(RendererKind::Kitty, CELL), false);
+    h.show(0, 0.0, request(10, 10));
+    for rows in [1e18, f64::MAX] {
+        h.strip.scroll(rows);
+        // The sizes of the pages on the way arrive after the move.
+        h.tick(Instant::now());
+        assert_position(&h, 4, 320.0 / 480.0);
+        assert!(!h.strip.moving());
+    }
+    h.strip.scroll(-f64::MAX);
+    h.tick(Instant::now());
+    assert_position(&h, 0, 0.0);
+}
+
+#[test]
 fn scrolling_before_the_anchor_page_has_its_size_waits_for_the_view() {
     let sixel = Recorder::new(RendererKind::Sixel, PIXEL);
     let mut h = harness(Pages::new((0..4).map(|i| rows_page(i, 80, 100)).collect()), sixel, false);
