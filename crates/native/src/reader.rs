@@ -210,8 +210,8 @@ impl Reader {
             "down" if zoomed && !webtoon => self.pan(0.0, 1.0),
             "left" if zoomed && !webtoon => self.pan(-1.0, 0.0),
             "right" if zoomed && !webtoon => self.pan(1.0, 0.0),
-            // From pages, the strip at the page in view, filling the width
-            // with `T`; from the strip at the other width, this width at the
+            // From pages, the strip at the page in view, at the theater
+            // width with `T`; from the strip at the other width, this width at the
             // same place; from the strip at this width, pages at the page on
             // top.
             "t" | "T" => {
@@ -229,13 +229,22 @@ impl Reader {
                 self.reset_view();
                 self.strip_shown = false;
             }
-            // The strip at the new width, at the same place.
+            // The strip a step narrower or wider, or a step for each of a
+            // count, at the same place and with the scrolling still to run.
             "[" | "]" if webtoon && state.theater => {
-                let width = if key == "[" { state.theater_width.saturating_sub(WIDTH_STEP) } else { state.theater_width + WIDTH_STEP };
-                let at = self.at();
-                (self.state.page, self.state.offset) = (at.page, at.offset);
-                self.state.theater_width = width.clamp(MIN_WIDTH, 100);
+                let delta = self.count.take().unwrap_or(1).min(20) as u8 * WIDTH_STEP;
+                let width = if key == "[" { state.theater_width.saturating_sub(delta) } else { state.theater_width.saturating_add(delta) };
+                let width = width.clamp(MIN_WIDTH, 100);
+                if width == state.theater_width {
+                    return None;
+                }
+                let (at, pending, carry) = (self.at(), self.strip.pending(), self.strip.carry());
+                (self.state.page, self.state.offset, self.state.theater_width) = (at.page, at.offset, width);
                 self.strip_shown = false;
+                self.show();
+                self.strip.scroll(pending);
+                self.strip.keep_carry(carry);
+                return None;
             }
             "R" => state.quarter_turns = (state.quarter_turns + 1) & 3,
             // A count names a one-based page for both.

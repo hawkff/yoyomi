@@ -209,7 +209,7 @@ pub struct App {
 
     spread: bool,
     webtoon: bool,
-    /// In webtoon mode, every page fills the width of the viewport.
+    /// In webtoon mode, every page is scaled to the theater width.
     theater: bool,
     pub zen: bool,
     pub help: bool,
@@ -875,7 +875,10 @@ impl App {
             }
             "t" => self.toggle_strip(false),
             "T" => self.toggle_strip(true),
-            "[" | "]" if self.webtoon && self.theater => self.widen(key == "]"),
+            "[" | "]" if self.webtoon && self.theater => {
+                let steps = self.take_count(1);
+                self.widen(key == "]", steps);
+            }
             "[" | "]" => self.status = "[ and ] set the page width in theater mode (T)".to_owned(),
             "z" => {
                 self.zen = !self.zen;
@@ -924,7 +927,7 @@ impl App {
         }
     }
 
-    /// `t` and `T`: from pages, the strip at the page in view, filling the
+    /// `t` and `T`: from pages, the strip at the page in view, at the theater
     /// width with `theater`; from the strip at the other width, the strip at
     /// this width at the same place; from the strip at this width, pages.
     fn toggle_strip(&mut self, theater: bool) {
@@ -959,13 +962,13 @@ impl App {
         }
     }
 
-    /// `[` and `]` in theater mode: pages `WIDTH_STEP` percent of the pane
-    /// narrower or `wider`, within `Settings::MIN_THEATER_WIDTH` and 100, at
-    /// the same place and with the scrolling still to run. The status bar
-    /// shows a width under 100 after the mode.
-    fn widen(&mut self, wider: bool) {
-        let width = self.settings.theater_width;
-        let next = if wider { width + WIDTH_STEP } else { width.saturating_sub(WIDTH_STEP) }.clamp(Settings::MIN_THEATER_WIDTH, 100);
+    /// `[` and `]` in theater mode: pages `steps` times `WIDTH_STEP` percent
+    /// of the pane narrower or `wider`, within `Settings::MIN_THEATER_WIDTH`
+    /// and 100, at the same place and with the scrolling still to run. The
+    /// status bar shows a width under 100 after the mode.
+    fn widen(&mut self, wider: bool, steps: usize) {
+        let (width, delta) = (self.settings.theater_width, steps.min(20) as u8 * WIDTH_STEP);
+        let next = if wider { width.saturating_add(delta) } else { width.saturating_sub(delta) }.clamp(Settings::MIN_THEATER_WIDTH, 100);
         if next == width {
             return;
         }
@@ -3198,6 +3201,11 @@ pub(crate) mod tests {
         assert_eq!((strip_place(&app).1, app.strip_request(0).fill), (pending, Some(90)));
         settle(&mut app);
 
+        // A count takes as many steps and is used up.
+        keys(&mut app, "3]");
+        assert_eq!((app.settings.theater_width, app.count.as_str()), (100, ""));
+        keys(&mut app, "3[");
+        assert_eq!((app.settings.theater_width, app.count.as_str()), (85, ""));
         keys(&mut app, &"[".repeat(20));
         assert_eq!(app.settings.theater_width, Settings::MIN_THEATER_WIDTH);
         assert_eq!(status(&mut app, "]"), " native  ·  theater 35%  ·  glide 280 ms");

@@ -331,11 +331,20 @@ fn brackets_set_the_width_of_theater_pages_at_the_same_place() {
     rig.frame();
     rig.reader.wheel(Wheel { dy: -25.0, precise: true, began: true, gesture: true, scale: 2.0 }, Instant::now());
     rig.ease();
-    rig.keys(&["["; 8]);
+    // The width changes with the scrolling still to run: at 95 percent a
+    // page is 95 x 190, and a view of 80 rows on from its quarter is row
+    // 127.5. A key that changes nothing leaves the scrolling alone.
+    rig.keys(&["j", "]", "["]);
+    rig.frame();
+    rig.ease();
+    let state = rig.reader.state();
+    assert!(state.theater_width == 95 && state.page == 1 && (state.offset - 127.5 / 190.0).abs() < 1e-9, "{state:?}");
+    // A count takes as many steps.
+    rig.keys(&["3", "[", "[", "[", "[", "["]);
     // At 60 percent a page is 60 x 120 in the middle of the view.
     let frame = rig.frame();
     let state = rig.reader.state();
-    assert!(state.theater_width == 60 && state.page == 1 && (state.offset - 0.25).abs() < 1e-9, "{state:?}");
+    assert!(state.theater_width == 60 && state.page == 1 && (state.offset - 127.5 / 190.0).abs() < 1e-9, "{state:?}");
     assert_eq!([19, 20, 79, 80].map(|x| pixel(&frame, x, 10).map(|pixel| pixel[3])), [Some(0), Some(255), Some(255), Some(0)]);
     rig.keys(&["["; 20]);
     assert_eq!(rig.reader.state().theater_width, MIN_WIDTH);

@@ -20,7 +20,7 @@ pub struct State {
     /// In webtoon mode, the fraction of `page` above the top of the view.
     pub offset: f64,
     pub webtoon: bool,
-    /// In webtoon mode, every page fills the width of the view.
+    /// In webtoon mode, every page is scaled to `theater_width`.
     pub theater: bool,
     pub quarter_turns: u8,
     pub zoom: f64,

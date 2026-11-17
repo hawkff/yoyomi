@@ -23,11 +23,11 @@ pub struct Settings {
 }
 
 /// The contents of `settings.json`. The numbers read as wide as JSON numbers
-/// go, so a value far out of range still loads, bounded. A file from before
-/// the width has none.
+/// go, so a value far out of range still loads, bounded. A setting the file
+/// lacks, as one from before the width does, loads as its default.
 #[derive(Serialize, Deserialize)]
 struct SettingsFile {
-    glide_ms: u64,
+    glide_ms: Option<u64>,
     theater_width: Option<u64>,
 }
 
@@ -56,20 +56,30 @@ impl Settings {
     /// `MIN_THEATER_WIDTH` and 100.
     pub fn load_from(path: Option<PathBuf>) -> Self {
         let file = path.as_deref().and_then(read);
-        let glide_ms = file.as_ref().map_or(Self::GLIDE_MS, |file| file.glide_ms.min(Self::MAX_GLIDE_MS.into()) as u16);
+        let glide_ms = file.as_ref().and_then(|file| file.glide_ms).map_or(Self::GLIDE_MS, |ms| ms.min(Self::MAX_GLIDE_MS.into()) as u16);
         let width =
             file.and_then(|file| file.theater_width).map_or(Self::THEATER_WIDTH, |width| width.clamp(Self::MIN_THEATER_WIDTH.into(), 100) as u8);
         Settings { glide_ms, theater_width: width, path, saved: (glide_ms, width) }
     }
 
-    /// Writes the settings when they changed since `load`.
+    /// Writes the settings when they changed since `load`. A setting that
+    /// did not change keeps the value the file holds by now, which another
+    /// reader may have saved.
     pub fn save(&mut self) -> Result<()> {
         let Some(path) = self.path.as_deref() else { return Ok(()) };
         if (self.glide_ms, self.theater_width) == self.saved {
             return Ok(());
         }
-        let file = SettingsFile { glide_ms: self.glide_ms.into(), theater_width: Some(self.theater_width.into()) };
-        storage::update(path, |_| serde_json::to_vec_pretty(&file).map_err(|error| Error::Format(error.to_string())))?;
+        storage::update(path, |latest| {
+            let mut file = serde_json::from_slice(latest).unwrap_or(SettingsFile { glide_ms: None, theater_width: None });
+            if self.glide_ms != self.saved.0 || file.glide_ms.is_none() {
+                file.glide_ms = Some(self.glide_ms.into());
+            }
+            if self.theater_width != self.saved.1 || file.theater_width.is_none() {
+                file.theater_width = Some(self.theater_width.into());
+            }
+            serde_json::to_vec_pretty(&file).map_err(|error| Error::Format(error.to_string()))
+        })?;
         self.saved = (self.glide_ms, self.theater_width);
         Ok(())
     }
@@ -123,15 +133,28 @@ mod tests {
         }
         // A file from before the width keeps its glide, and a width out of
         // range loads bounded.
-        for (text, width) in [
-            (r#"{"glide_ms": 320}"#, Settings::THEATER_WIDTH),
-            (r#"{"glide_ms": 320, "theater_width": 5}"#, Settings::MIN_THEATER_WIDTH),
-            (r#"{"glide_ms": 320, "theater_width": 70000}"#, 100),
-            (r#"{"glide_ms": 320, "theater_width": 65}"#, 65),
+        for (text, glide_ms, width) in [
+            (r#"{"glide_ms": 320}"#, 320, Settings::THEATER_WIDTH),
+            (r#"{"glide_ms": 320, "theater_width": 5}"#, 320, Settings::MIN_THEATER_WIDTH),
+            (r#"{"glide_ms": 320, "theater_width": 70000}"#, 320, 100),
+            (r#"{"glide_ms": 320, "theater_width": 65}"#, 320, 65),
+            (r#"{"theater_width": 65}"#, Settings::GLIDE_MS, 65),
         ] {
             fs::write(&path, text).unwrap();
             let loaded = Settings::load_from(Some(path.clone()));
-            assert_eq!((loaded.glide_ms, loaded.theater_width), (320, width), "{text}");
+            assert_eq!((loaded.glide_ms, loaded.theater_width), (glide_ms, width), "{text}");
+        }
+        // Two readers that each change one setting keep both, in either
+        // order of saving.
+        for glide_first in [true, false] {
+            fs::write(&path, r#"{"glide_ms": 280, "theater_width": 100}"#).unwrap();
+            let (mut glide, mut width) = (Settings::load_from(Some(path.clone())), Settings::load_from(Some(path.clone())));
+            (glide.glide_ms, width.theater_width) = (320, 95);
+            let (first, second) = if glide_first { (&mut glide, &mut width) } else { (&mut width, &mut glide) };
+            first.save().unwrap();
+            second.save().unwrap();
+            let loaded = Settings::load_from(Some(path.clone()));
+            assert_eq!((loaded.glide_ms, loaded.theater_width), (320, 95), "glide first: {glide_first}");
         }
         // Saving over a broken file replaces it.
         fs::write(&path, "{not json").unwrap();
