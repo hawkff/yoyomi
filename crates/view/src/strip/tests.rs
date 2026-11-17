@@ -213,7 +213,7 @@ fn harness_on(book: Arc<Pages>, renderer: Arc<dyn Renderer>, resident: Resident)
 }
 
 fn request(cols: u16, rows: u16) -> StripRequest {
-    StripRequest { grid: Grid::new(cols, rows), quarter_turns: 0, invert: false, fill: false }
+    StripRequest { grid: Grid::new(cols, rows), quarter_turns: 0, invert: false, fill: None }
 }
 
 impl Harness {
@@ -580,7 +580,7 @@ fn sliding_bands_reach_only_as_far_as_their_pages() {
 
         // Pages filled to the width make bands as wide as the viewport.
         let mut h = harness(Pages::new(vec![rows_page(0, 30, 100), rows_page(1, 50, 100)]), kitty.clone(), false);
-        let shown = h.show(0, 0.0, StripRequest { fill: true, ..request(10, 10) }).shown.expect("a frame");
+        let shown = h.show(0, 0.0, StripRequest { fill: Some(100), ..request(10, 10) }).shown.expect("a frame");
         let width = h.view().width;
         assert!(matches!(shown.scene.layers[..], [Layer::KittySlice { left: 0, width: w, .. }] if w == width), "{:?}", shown.scene.layers);
         assert_eq!(kitty.image(h.band(0).id).width(), width);
@@ -772,7 +772,7 @@ fn fill_scales_every_page_to_the_viewport_width() {
     let pages = vec![solid(40, 20, RED), solid(200, 100, BLUE), solid(100, 100, GREEN)];
     let sixel = Recorder::new(RendererKind::Sixel, PIXEL);
     let mut h = harness(Pages::new(pages.clone()), sixel.clone(), false);
-    h.show(0, 0.0, StripRequest { fill: true, ..request(100, 100) });
+    h.show(0, 0.0, StripRequest { fill: Some(100), ..request(100, 100) });
     // The narrow page grows to 100 x 50, and the wide one shrinks to 100 x 50
     // right under it.
     let frame = sixel.last();
@@ -782,6 +782,14 @@ fn fill_scales_every_page_to_the_viewport_width() {
     assert_eq!(pixel(&frame, 99, 99), BLUE);
     h.scroll(55.0);
     assert_position(&h, 1, 0.1);
+
+    // At 60 percent every page is 60 pixels wide, centered: 60 x 30, 60 x 30
+    // and 60 x 60.
+    let mut h = harness(Pages::new(pages.clone()), sixel.clone(), false);
+    h.show(0, 0.0, StripRequest { fill: Some(60), ..request(100, 100) });
+    let frame = sixel.last();
+    assert_eq!((pixel(&frame, 19, 0), pixel(&frame, 20, 0), pixel(&frame, 79, 29), pixel(&frame, 80, 29)), (CLEAR, RED, RED, CLEAR));
+    assert_eq!((pixel(&frame, 20, 30), pixel(&frame, 79, 59), pixel(&frame, 50, 60)), (BLUE, BLUE, GREEN));
 
     // Without fill the narrow page keeps its 40 x 20 and the wide one still
     // shrinks.
@@ -802,7 +810,7 @@ fn a_page_filled_far_past_the_viewport_scales_only_the_sections_in_view() {
     let mut h = harness(Pages::new(vec![rows_page(0, 10, 40_000)]), sixel.clone(), false);
     let scaled = h.strip.cx.scaled.clone();
     for (offset, scales) in [(0.0, 1), (0.5, 2)] {
-        let shown = h.show(0, offset, StripRequest { fill: true, ..request(1000, 100) }).shown.expect("a frame");
+        let shown = h.show(0, offset, StripRequest { fill: Some(100), ..request(1000, 100) }).shown.expect("a frame");
         assert!(shown.errors.is_empty(), "{:?}", shown.errors);
         assert_eq!(scaled.scales(), scales, "the viewport lies in one section");
     }
@@ -859,7 +867,7 @@ fn a_frame_across_a_section_join_and_a_page_join_shows_every_row_once() {
     let whole: Vec<RgbaImage> = pages.iter().map(|page| scale(page, 120, page.height() * 3)).collect();
     let sixel = Recorder::new(RendererKind::Sixel, PIXEL);
     let mut h = harness(Pages::new(pages), sixel.clone(), false);
-    h.show(0, 0.0, StripRequest { fill: true, ..request(120, 300) });
+    h.show(0, 0.0, StripRequest { fill: Some(100), ..request(120, 300) });
     let top = SECTION_ROWS - 100;
     h.scroll(f64::from(top));
     let frame = sixel.last();
@@ -895,7 +903,7 @@ fn scrolling_a_long_strip_keeps_its_sections_within_the_budget() {
     let pages = (0..4).map(|i| rows_page(i, 100, 2 * SECTION_ROWS)).collect();
     let sixel = Recorder::new(RendererKind::Sixel, PIXEL);
     let mut h = harness(Pages::new(pages), sixel, false);
-    h.show(0, 0.0, StripRequest { fill: true, ..request(1000, 100) });
+    h.show(0, 0.0, StripRequest { fill: Some(100), ..request(1000, 100) });
     let scaled = h.strip.cx.scaled.clone();
     assert!(80 * 1000 * u64::from(SECTION_ROWS) > ScaledPages::MAX_PIXELS);
     // A section at a time, each frame inside one.
@@ -914,7 +922,7 @@ fn half_blocks_fill_the_viewport_width() {
     let mut h = harness(Pages::new(vec![solid(40, 400, RED)]), half.clone(), false);
     // 25 cells across compose 25 pixels wide; the 40-pixel page fills them
     // rather than shrinking to one pixel per cell.
-    h.show(0, 0.0, StripRequest { fill: true, ..request(25, 25) });
+    h.show(0, 0.0, StripRequest { fill: Some(100), ..request(25, 25) });
     let frame = half.last();
     assert_eq!(frame.dimensions(), (25, 50));
     assert_eq!(pixel(&frame, 0, 10), RED);

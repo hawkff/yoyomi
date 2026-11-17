@@ -317,6 +317,33 @@ fn plus_and_minus_set_the_glide_in_the_strip_modes_and_zoom_pages() {
 }
 
 #[test]
+fn brackets_set_the_width_of_theater_pages_at_the_same_place() {
+    let state = State { webtoon: true, theater: true, theater_width: 5, ..State::default() };
+    let narrow = rig(book(pages(1, 100, 2000), None), state, (100, 80));
+    assert_eq!(narrow.reader.state().theater_width, MIN_WIDTH, "a width under the narrowest starts at the narrowest");
+
+    let mut rig = rig(book(pages(3, 50, 100), None), State { page: 1, ..State::default() }, (100, 80));
+    rig.keys(&["[", "t", "["]);
+    assert_eq!(rig.reader.state().theater_width, 100, "pages and webtoon mode keep the width");
+    rig.keys(&["T", "]"]);
+    assert_eq!(rig.reader.state().theater_width, 100, "no wider than the view");
+    // A theater page is 100 x 200: 50 pixels down is a quarter of page 1.
+    rig.frame();
+    rig.reader.wheel(Wheel { dy: -25.0, precise: true, began: true, gesture: true, scale: 2.0 }, Instant::now());
+    rig.ease();
+    rig.keys(&["["; 8]);
+    // At 60 percent a page is 60 x 120 in the middle of the view.
+    let frame = rig.frame();
+    let state = rig.reader.state();
+    assert!(state.theater_width == 60 && state.page == 1 && (state.offset - 0.25).abs() < 1e-9, "{state:?}");
+    assert_eq!([19, 20, 79, 80].map(|x| pixel(&frame, x, 10).map(|pixel| pixel[3])), [Some(0), Some(255), Some(255), Some(0)]);
+    rig.keys(&["["; 20]);
+    assert_eq!(rig.reader.state().theater_width, MIN_WIDTH);
+    assert_eq!(rig.keys(&["]", "f"]), Some(Action::Return));
+    assert_eq!(rig.reader.state().theater_width, MIN_WIDTH + WIDTH_STEP, "the state returned carries the width");
+}
+
+#[test]
 fn a_key_glides_for_the_glide_time_and_a_trackpad_moves_at_once() {
     // 400 ms from the state, less two steps of `-`.
     let state = State { webtoon: true, glide_ms: 400, ..State::default() };

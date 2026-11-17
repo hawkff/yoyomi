@@ -29,8 +29,10 @@ pub struct StripRequest {
     pub quarter_turns: u8,
     /// Invert the pages the book allows.
     pub invert: bool,
-    /// Scale every page to the width of the viewport, enlarging narrow ones.
-    pub fill: bool,
+    /// Scale every page to this percent of the viewport's width, at most
+    /// 100, enlarging narrow ones. Without it a page keeps its size and only
+    /// shrinks to the viewport.
+    pub fill: Option<u8>,
 }
 
 /// A place in the strip: a page, and the fraction of it above the top of the
@@ -509,15 +511,18 @@ impl Drop for Strip {
     }
 }
 
-/// A page of `size` in the strip: turned, then scaled to `width` with
-/// `request.fill`, else shrunk to `width` when wider and to the strip's pixel
-/// unit. A page whose size did not load takes the viewport's size, and its
-/// decode reports the error.
+/// A page of `size` in the strip: turned, then scaled to the percent of
+/// `width` that `request.fill` names, else shrunk to `width` when wider and
+/// to the strip's pixel unit. A page whose size did not load takes the
+/// viewport's size, and its decode reports the error.
 fn scaled_size(size: Option<(u32, u32)>, request: &StripRequest, unit: f64, width: u32, height: u32) -> (u32, u32) {
     let Some((w, h)) = size else { return (width, height) };
     let (w, h) = if request.quarter_turns & 1 == 1 { (h, w) } else { (w, h) };
     let to_width = f64::from(width) / f64::from(w);
-    let scale = if request.fill { to_width } else { (1.0 / unit).min(to_width) };
+    let scale = match request.fill {
+        Some(percent) => to_width * f64::from(percent.min(100)) / 100.0,
+        None => (1.0 / unit).min(to_width),
+    };
     let fit = |side: u32| ((f64::from(side) * scale).round() as u32).max(1);
     (fit(w), fit(h))
 }
