@@ -451,15 +451,14 @@ there to use the terminal's own selection.
 
 `f` opens the active pane's book in a fullscreen window and hands over the
 page, the webtoon or theater position, the glide time, the theater width,
-rotation, zoom, spread and inversion. `f` in the window brings them back to
-the terminal.
-The window draws at the screen's full resolution and, like the terminal,
-turns to pages rendered ahead. Its keys follow the terminal's: counts,
-`j`/`k`/`J`/`K`, `g`/`G` (`42G` goes to page 42), `s`, `t`, `T`, `[`/`]`,
-`R`, `i`, `+`/`-`/`0` and the arrows to pan. The mouse wheel and the trackpad turn
-pages, and a click follows a link. In webtoon and theater mode, keys and
-the wheel glide, and the strip follows the fingers on the trackpad. `Q`
-saves the positions of the open books and quits. `q` or closing the window
+rotation, zoom, spread and inversion. `f` in the window brings them back to the
+terminal. The window draws at the screen's full resolution and, like the
+terminal, turns to pages rendered ahead. Its keys follow the terminal's:
+counts, `j`/`k`/`J`/`K`, `g`/`G` (`42G` goes to page 42), `s`, `t`, `T`,
+`[`/`]`, `R`, `i`, `+`/`-`/`0` and the arrows to pan. The mouse wheel and the
+trackpad turn pages, and a click follows a link. In webtoon and theater mode,
+keys and the wheel glide, and the strip follows the fingers on the trackpad.
+`Q` saves the positions of the open books and quits. `q` or closing the window
 forgets them and quits. On other systems, `f` reports that the window is
 unavailable.
 
