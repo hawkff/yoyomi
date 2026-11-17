@@ -68,7 +68,8 @@ pub struct Paint {
     data: Arc<[u8]>,
 }
 
-/// A kitty slice placed with its first row in screen cell (`x`, `y`).
+/// A kitty slice placed with its first row in screen cell (`x`, `y`), at
+/// pixel offset (`x_offset`, `y_offset`) inside it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Placement {
     id: ImageId,
@@ -77,7 +78,8 @@ pub struct Placement {
     width: u32,
     top: u32,
     height: u32,
-    offset: u32,
+    x_offset: u32,
+    y_offset: u32,
 }
 
 /// Writes one frame inside a synchronized update: the kitty uploads of the
@@ -139,7 +141,7 @@ fn place_slices(out: &mut impl Write, placed: &mut Vec<Placement>, placements: V
     }
     for new in placements.iter().filter(|new| !placed.contains(new)) {
         write!(out, "\x1b7\x1b[{};{}H", new.y + 1, new.x + 1)?;
-        out.write_all(&place(new.id, new.width, new.top, new.height, new.offset))?;
+        out.write_all(&place(new.id, new.width, new.top, new.height, new.x_offset, new.y_offset))?;
         out.write_all(b"\x1b8")?;
     }
     *placed = placements;
@@ -157,15 +159,32 @@ fn placements(app: &App) -> Vec<Placement> {
     for i in (0..app.pane_count()).filter(|&i| app.body_errors(i).is_empty()) {
         let (Some(shown), image) = (app.shown(i), app.scene_box(i)) else { continue };
         for layer in &shown.scene.layers {
-            let Layer::KittySlice { id, width, top, height, at, offset } = *layer else { continue };
+            let Layer::KittySlice { id, left, width, top, height, at, offset } = *layer else { continue };
             // A pixel of slack for cells of a fractional size.
             let fits = |cells: u16, from: u16, px: u32, size: f64| f64::from(from) * size + f64::from(px) <= f64::from(cells) * size + 1.0;
-            if fits(image.cols, at.col, width, cell.w) && fits(image.rows, at.row, offset + height, cell.h) {
-                placements.push(Placement { id, x: image.x + at.col, y: image.y + at.row, width, top, height, offset });
+            if fits(image.cols, at.col, left + width, cell.w) && fits(image.rows, at.row, offset + height, cell.h) {
+                let (col, x_offset) = cell_at(left, cell.w);
+                let (x, y) = (image.x + at.col + col, image.y + at.row);
+                placements.push(Placement { id, x, y, width, top, height, x_offset, y_offset: offset });
             }
         }
     }
     placements
+}
+
+/// The cell that pixel `px` of a row of cells `size` pixels wide lies in,
+/// and the pixels from the cell's left edge to it. Cell `c` starts at pixel
+/// `c * size` rounded, as the strip counts rows.
+fn cell_at(px: u32, size: f64) -> (u16, u32) {
+    let edge = |cell: u32| (f64::from(cell) * size).round() as u32;
+    let mut cell = (f64::from(px) / size).floor() as u32;
+    while cell > 0 && edge(cell) > px {
+        cell -= 1;
+    }
+    while edge(cell + 1) <= px {
+        cell += 1;
+    }
+    (cell as u16, px - edge(cell))
 }
 
 /// The kitty images of the scenes `draw` draws.
@@ -342,8 +361,8 @@ fn draw_layer(buf: &mut Buffer, image: ImageBox, layer: &Layer, sixel_fresh: boo
                     .set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::MIN));
             });
         }
-        Layer::KittySlice { width, height, at, offset, .. } => {
-            let grid = Grid::new(cells_for(*width, cell.w, u16::MAX), cells_for(offset + height, cell.h, u16::MAX));
+        Layer::KittySlice { left, width, height, at, offset, .. } => {
+            let grid = Grid::new(cells_for(left + width, cell.w, u16::MAX), cells_for(offset + height, cell.h, u16::MAX));
             each_cell(buf, image, *at, grid, |_, _, blank| {
                 blank.reset();
             });
@@ -904,20 +923,29 @@ pub(crate) mod tests {
     fn kitty_slices_place_after_the_cells_and_again_only_when_they_change() {
         let (mut app, _) = app_with(Arc::new(Kitty::new(CellSize::FALLBACK, false).with_slides(true)), 20, 8);
         open(&mut app);
-        let slice = |id, top, height, row, offset| Layer::KittySlice { id: ImageId(id), width: 160, top, height, at: At { col: 0, row }, offset };
+        let slice = |id, left, top, height, row, offset| Layer::KittySlice {
+            id: ImageId(id),
+            left,
+            width: 160 - left,
+            top,
+            height,
+            at: At { col: 0, row },
+            offset,
+        };
         let text = Layer::Text { lines: vec!["cells".to_owned()].into(), at: At { col: 0, row: 5 } };
         app.uploads.push(Upload { id: ImageId(7), bytes: b"<seven>".as_slice().into() });
         app.uploads.push(Upload { id: ImageId(9), bytes: b"<ahead>".as_slice().into() });
         // The body starts on screen row 1: slice 7 fills its rows 0 to 2.5,
-        // slice 8 goes on from half of row 2.
-        app.apply(shown(vec![slice(7, 5, 40, 0, 0), slice(8, 0, 30, 2, 8), text.clone()], Vec::new()));
+        // slice 8 goes on from half of row 2, 20 pixels from the left: half
+        // of column 2.
+        app.apply(shown(vec![slice(7, 0, 5, 40, 0, 0), slice(8, 20, 0, 30, 2, 8), text.clone()], Vec::new()));
         let options = TerminalOptions { viewport: Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 20, 8)) };
         let written = Recorder::default();
         let mut terminal = Terminal::with_options(CrosstermBackend::new(written.clone()), options).unwrap();
         let out = write(&mut terminal, &written, &mut app);
         let at = |needle: &str| out.find(needle).unwrap_or_else(|| panic!("{needle:?} missing from {out:?}"));
-        let seven = "\x1b7\x1b[2;1H\x1b_Ga=p,i=7,p=1,x=0,y=5,w=160,h=40,Y=0,C=1,q=2\x1b\\\x1b8";
-        let eight = "\x1b7\x1b[4;1H\x1b_Ga=p,i=8,p=1,x=0,y=0,w=160,h=30,Y=8,C=1,q=2\x1b\\\x1b8";
+        let seven = "\x1b7\x1b[2;1H\x1b_Ga=p,i=7,p=1,x=0,y=5,w=160,h=40,X=0,Y=0,C=1,q=2\x1b\\\x1b8";
+        let eight = "\x1b7\x1b[4;3H\x1b_Ga=p,i=8,p=1,x=0,y=0,w=140,h=30,X=4,Y=8,C=1,q=2\x1b\\\x1b8";
         assert_eq!(at("\x1b[?2026h"), 0);
         assert!(at("<seven>") < at("cells") && at("cells") < at(seven) && at(seven) < at(eight), "{out:?}");
         assert!(out.ends_with(&format!("{eight}\x1b[?2026l<ahead>")), "{out:?}");
@@ -928,10 +956,10 @@ pub(crate) mod tests {
         assert!(!out.contains("\x1b_G"), "an unchanged frame places nothing: {out:?}");
 
         // Slice 8 moves and slice 7 leaves: 7 is unplaced once, 8 placed anew.
-        app.apply(shown(vec![slice(8, 0, 30, 0, 9), text.clone()], Vec::new()));
+        app.apply(shown(vec![slice(8, 0, 0, 30, 0, 9), text.clone()], Vec::new()));
         let out = write(&mut terminal, &written, &mut app);
         assert_eq!(out.matches("\x1b_G").count(), 2, "{out:?}");
-        assert!(out.contains("\x1b_Ga=d,d=i,i=7,p=1,q=2\x1b\\") && out.contains("\x1b[2;1H\x1b_Ga=p,i=8,p=1,x=0,y=0,w=160,h=30,Y=9,"), "{out:?}");
+        assert!(out.contains("\x1b_Ga=d,d=i,i=7,p=1,q=2\x1b\\") && out.contains("\x1b[2;1H\x1b_Ga=p,i=8,p=1,x=0,y=0,w=160,h=30,X=0,Y=9,"), "{out:?}");
         assert!(!write(&mut terminal, &written, &mut app).contains("\x1b_G"), "a slice that left is unplaced once");
 
         // An overlay unplaces the slices, and its closing places them again.
@@ -945,6 +973,8 @@ pub(crate) mod tests {
         app.uploads.push(Upload { id: ImageId(8), bytes: b"<eight>".as_slice().into() });
         let out = write(&mut terminal, &written, &mut app);
         assert!(out.find("<eight>") < out.find("a=p,i=8") && out.contains("a=p,i=8"), "{out:?}");
+        // Columns start at their rounded pixel, as rows do.
+        assert_eq!([cell_at(20, 8.0), cell_at(20, 7.3), cell_at(21, 7.3), cell_at(0, 7.3)], [(2, 4), (2, 5), (2, 6), (0, 0)]);
     }
 
     #[test]

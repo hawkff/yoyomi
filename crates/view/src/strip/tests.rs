@@ -511,11 +511,11 @@ fn assert_slices_tile_the_viewport(h: &Harness, kitty: &Recorder, update: &Updat
     let (top, cell_top) = (view.top.round() as i64, |row: u16| (f64::from(row) * view.cell_h).round() as i64);
     let mut y = 0;
     for layer in &shown.scene.layers {
-        let Layer::KittySlice { id, width, top: from, height, at, offset } = *layer else { panic!("not a slice: {layer:?}") };
-        assert_eq!((width, at.col), (view.width, 0), "{layer:?}");
+        let Layer::KittySlice { id, left, width, top: from, height, at, offset } = *layer else { panic!("not a slice: {layer:?}") };
+        let band = kitty.image(id);
+        assert_eq!((left, width, at.col), ((view.width - band.width()) / 2, band.width(), 0), "{layer:?} covers the page");
         assert!(at.row < view.rows && f64::from(offset) < view.cell_h.ceil(), "{layer:?}");
         assert_eq!(cell_top(at.row) + i64::from(offset), y, "{layer:?} starts where the slice above ends");
-        let band = kitty.image(id);
         assert!(height > 0 && from + height <= band.height(), "{layer:?} inside a band of {} rows", band.height());
         for row in 0..height {
             let [_, high, low, _] = pixel(&band, band.width() / 2, from + row);
@@ -552,6 +552,38 @@ fn sliding_slices_cover_the_viewport_at_any_pixel() {
             assert!(update.shown.is_some(), "step {step}");
             assert_slices_tile_the_viewport(&h, &kitty, &update);
         }
+    }
+}
+
+#[test]
+fn sliding_bands_reach_only_as_far_as_their_pages() {
+    for cell in [CELL, CellSize { w: 7.3, h: 15.6 }] {
+        // Ten columns of 80 or 73 pixels; band 0 holds pages of 30 and 50
+        // pixels, band 2 one page of 30.
+        let kitty = Recorder::sliding(cell);
+        let pages = vec![rows_page(0, 30, 100), rows_page(1, 50, 100), rows_page(2, 30, 400)];
+        let mut h = harness(Pages::new(pages), kitty.clone(), false);
+        let shown = h.show(0, 0.0, request(10, 10)).shown.expect("a frame");
+        let width = h.view().width;
+        let [Layer::KittySlice { id, left, width: 50, .. }] = shown.scene.layers[..] else { panic!("{:?}", shown.scene.layers) };
+        assert_eq!(left, (width - 50) / 2, "the slice starts at the wider page");
+        let band = kitty.image(id);
+        let narrow = (width - 30) / 2 - left;
+        assert_eq!(band.width(), 50);
+        assert_eq!((pixel(&band, narrow, 0), pixel(&band, narrow + 29, 99)), ([0, 0, 0, 255], [0, 99, 0, 255]));
+        assert_eq!((pixel(&band, narrow - 1, 0), pixel(&band, narrow + 30, 0)), (CLEAR, CLEAR), "the narrower page leaves clear margins");
+        assert_eq!(pixel(&band, 0, 100), [1, 0, 0, 255]);
+        h.strip.shift(25.0);
+        h.tick(Instant::now());
+        let band = kitty.image(h.band(2).id);
+        assert_eq!((band.width(), pixel(&band, 0, 0)[0]), (30, 2), "a band of page 3 alone is as wide as it");
+
+        // Pages filled to the width make bands as wide as the viewport.
+        let mut h = harness(Pages::new(vec![rows_page(0, 30, 100), rows_page(1, 50, 100)]), kitty.clone(), false);
+        let shown = h.show(0, 0.0, StripRequest { fill: true, ..request(10, 10) }).shown.expect("a frame");
+        let width = h.view().width;
+        assert!(matches!(shown.scene.layers[..], [Layer::KittySlice { left: 0, width: w, .. }] if w == width), "{:?}", shown.scene.layers);
+        assert_eq!(kitty.image(h.band(0).id).width(), width);
     }
 }
 

@@ -124,10 +124,12 @@ struct View {
     bands: HashMap<i64, Band>,
 }
 
-/// A kitty band: `band_rows` terminal rows of the strip as one image.
+/// A kitty band: `band_rows` terminal rows of the strip as one image, which
+/// covers the viewport's columns `span`, as pixels from its left edge and a
+/// width.
 enum Band {
     Rendering { lease: Lease, cancel: Cancel },
-    Ready { lease: Lease, frame: Frame, errors: Vec<String> },
+    Ready { lease: Lease, frame: Frame, errors: Vec<String>, span: (u32, u32) },
     Failed(String),
 }
 
@@ -148,7 +150,7 @@ impl Band {
 /// A finished job of the strip.
 enum Done {
     Size { page: usize, result: Result<(u32, u32)> },
-    Band { generation: u64, index: i64, lease: Lease, result: Result<(Frame, Vec<String>)> },
+    Band { generation: u64, index: i64, lease: Lease, span: (u32, u32), result: Result<(Frame, Vec<String>)> },
     Frame { generation: u64, job: u64, page: usize, result: Result<(Frame, Vec<String>)> },
 }
 
@@ -662,10 +664,22 @@ impl View {
 
     /// Starts rendering band `index`, unless no page reaches into it or, for
     /// a band around the viewport, the image budget has no room for it.
+    /// Where the strip slides, a band reaches from the leftmost pixel of its
+    /// pages to the rightmost.
     fn render_band(&mut self, cx: &Context, index: i64, priority: Priority) {
         let (y, height) = self.band_span(index);
-        let pieces = self.pieces(&cx.book, y, height);
-        let bytes = 4 * u64::from(self.width) * u64::from(height);
+        let mut pieces = self.pieces(&cx.book, y, height);
+        let (mut left, mut width) = (0, self.width);
+        if self.slides
+            && let Some(from) = pieces.iter().map(|piece| piece.x).min()
+        {
+            let to = pieces.iter().map(|piece| piece.x + piece.key.width).max().unwrap_or(from).min(self.width);
+            (left, width) = (from, to - from);
+            for piece in &mut pieces {
+                piece.x -= left;
+            }
+        }
+        let bytes = 4 * u64::from(width) * u64::from(height);
         if pieces.is_empty() || (priority == Priority::Neighbor && !cx.resident.room(bytes)) {
             return;
         }
@@ -673,7 +687,8 @@ impl View {
         let cancel = Cancel::new();
         let generation = self.generation;
         let grid = (!self.slides).then(|| Grid::new(self.cols, self.band_rows as u16));
-        cx.render(priority, &cancel, pieces, (self.width, height), lease.id, grid, move |result| Done::Band { generation, index, lease, result });
+        let done = move |result| Done::Band { generation, index, lease, span: (left, width), result };
+        cx.render(priority, &cancel, pieces, (width, height), lease.id, grid, done);
         self.bands.insert(index, Band::Rendering { lease, cancel });
     }
 
@@ -694,12 +709,12 @@ impl View {
         let (mut layers, mut errors) = (Vec::new(), Vec::new());
         for index in self.band_ranges().0 {
             match self.bands.get(&index) {
-                Some(Band::Ready { lease, errors: failed, .. }) if self.slides => {
-                    layers.extend(self.slice(index, lease.id));
+                Some(Band::Ready { lease, errors: failed, span, .. }) if self.slides => {
+                    layers.extend(self.slice(index, lease.id, *span));
                     cx.resident.touch(*lease);
                     errors.extend(failed.iter().cloned());
                 }
-                Some(Band::Ready { lease, frame, errors: failed }) => {
+                Some(Band::Ready { lease, frame, errors: failed, .. }) => {
                     // Placeholder rows past the grid the renderer returned
                     // would point outside the image.
                     let grid = frame.grid();
@@ -726,17 +741,18 @@ impl View {
         Shown { page: self.position().page, scene: Scene { layers }, errors }
     }
 
-    /// The rows of band `index`, kept as image `id`, that the viewport
-    /// shows, as a slice from the cell where they start; none when the band
-    /// lies outside the viewport.
-    fn slice(&self, index: i64, id: ImageId) -> Option<Layer> {
+    /// The rows of band `index`, kept as image `id` and covering the
+    /// viewport's columns `span`, as pixels from its left edge and a width,
+    /// that the viewport shows, as a slice from the cell where they start;
+    /// none when the band lies outside the viewport.
+    fn slice(&self, index: i64, id: ImageId, (left, width): (u32, u32)) -> Option<Layer> {
         let top = self.top.round() as i64;
         let (start, height) = self.band_span(index);
         let from = top.max(start);
         let to = (top + i64::from(self.height)).min(start + i64::from(height));
         (to > from).then(|| {
             let (row, offset) = self.cell_at(from - top);
-            Layer::KittySlice { id, width: self.width, top: (from - start) as u32, height: (to - from) as u32, at: At { col: 0, row }, offset }
+            Layer::KittySlice { id, left, width, top: (from - start) as u32, height: (to - from) as u32, at: At { col: 0, row }, offset }
         })
     }
 
@@ -816,7 +832,7 @@ impl View {
         let mut update = Update::default();
         match done {
             Done::Size { .. } => return self.sized(cx),
-            Done::Band { generation, index, lease, result } => {
+            Done::Band { generation, index, lease, span, result } => {
                 let current = matches!(self.bands.get(&index), Some(Band::Rendering { lease: running, .. }) if *running == lease);
                 if generation != self.generation || !current {
                     return update;
@@ -839,7 +855,7 @@ impl View {
                         if !cx.resident.resend() {
                             update.uploads.extend(Upload::from_frame(&frame));
                         }
-                        Band::Ready { lease, frame, errors }
+                        Band::Ready { lease, frame, errors, span }
                     }
                     Err(error) => {
                         cx.resident.release(lease);
