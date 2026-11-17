@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use fast_image_resize::images::{Image, ImageRef};
+use fast_image_resize::images::{CroppedImage, Image, ImageRef};
 use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
 use yoyomi_core::image::imageops;
 use yoyomi_core::{PageRect, Pixels, RgbaImage, Transform};
@@ -21,6 +21,59 @@ pub fn scale(image: &RgbaImage, width: u32, height: u32) -> RgbaImage {
     // to the opaque ones next to them.
     let options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear));
     Resizer::new().resize(&src, &mut dst, &options).expect("both images hold RGBA pixels");
+    out
+}
+
+/// The pixels `x..x + w` across and `y..y + h` down of `image` turned
+/// clockwise by `quarter_turns` and scaled to `width` x `height`, equal to
+/// within one level per channel to those pixels of
+/// `scale(&rotate(image, quarter_turns), width, height)`. It turns and scales
+/// only the source the part needs. The part lies inside `width` x `height`.
+pub fn scale_part(image: &RgbaImage, quarter_turns: u8, (width, height): (u32, u32), (x, y, w, h): (u32, u32, u32, u32)) -> RgbaImage {
+    let mut out = RgbaImage::new(w.max(1), h.max(1));
+    if image.width() == 0 || image.height() == 0 {
+        return out;
+    }
+    let (w, h) = out.dimensions();
+    let turns = quarter_turns & 3;
+    let (turned_w, turned_h) = if turns & 1 == 1 { (image.height(), image.width()) } else { image.dimensions() };
+    // The source span of `len` scaled pixels from `start`, widened by the
+    // reach of the bilinear filter: cut at the part's edge, the filter would
+    // clamp there and leave a seam. Returns the widened span and the span
+    // inside it.
+    let span = |start: u32, len: u32, size: u32, scaled: u32| {
+        let factor = f64::from(size) / f64::from(scaled.max(1));
+        let (from, to) = (f64::from(start) * factor, (f64::from(start + len) * factor).min(f64::from(size)));
+        let reach = factor.max(1.0) + 1.0;
+        let lo = (from - reach).floor().max(0.0) as u32;
+        let hi = ((to + reach).ceil() as u32).min(size);
+        let (inside, offset) = (f64::from(hi - lo), from - f64::from(lo));
+        // Rounding must not carry the crop past the widened span.
+        let len = (to - from).min(inside - offset);
+        (lo, hi - lo, offset, if offset + len > inside { len.next_down() } else { len })
+    };
+    let (x0, cols, left, crop_w) = span(x, w, turned_w, width);
+    let (y0, rows, top, crop_h) = span(y, h, turned_h, height);
+    // The widened part, turned: the source rectangle that turns into it.
+    let turned = (turns != 0).then(|| {
+        let (iw, ih) = image.dimensions();
+        let source = match turns {
+            1 => imageops::crop_imm(image, y0, ih - x0 - cols, rows, cols),
+            2 => imageops::crop_imm(image, iw - x0 - cols, ih - y0 - rows, cols, rows),
+            _ => imageops::crop_imm(image, iw - y0 - rows, x0, rows, cols),
+        };
+        match turns {
+            1 => imageops::rotate90(&*source),
+            2 => imageops::rotate180(&*source),
+            _ => imageops::rotate270(&*source),
+        }
+    });
+    let (source, (sx, sy)) = turned.as_ref().map_or((image, (x0, y0)), |turned| (turned, (0, 0)));
+    let src = ImageRef::new(source.width(), source.height(), source.as_raw(), PixelType::U8x4).expect("an RgbaImage holds 4 bytes per pixel");
+    let around = CroppedImage::new(&src, sx, sy, cols, rows).expect("the widened part lies inside the image");
+    let mut dst = Image::from_slice_u8(w, h, &mut out, PixelType::U8x4).expect("an RgbaImage holds 4 bytes per pixel");
+    let options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear)).crop(left, top, crop_w, crop_h);
+    Resizer::new().resize(&around, &mut dst, &options).expect("the crop lies inside the widened part");
     out
 }
 
@@ -123,6 +176,39 @@ mod tests {
         assert!((100..156).contains(&a), "alpha {a}");
         assert_eq!(scale(&image, 7, 3).dimensions(), (7, 3));
         assert_eq!(scale(&RgbaImage::new(0, 0), 0, 4).dimensions(), (1, 4));
+    }
+
+    #[test]
+    fn scale_part_matches_the_same_pixels_of_the_whole_image_scaled() {
+        // Every row and column has its own color.
+        let image = RgbaImage::from_fn(40, 30, |x, y| Rgba([(x * 13 + y) as u8, (y * 7 + x) as u8, (x * 5 + y * 3) as u8, 255]));
+        for turns in 0..4 {
+            let turned = rotate(&image, turns);
+            let (tw, th) = turned.dimensions();
+            // Enlarging and shrinking, each by a factor that is not whole.
+            for (width, height) in [(tw * 5 / 2, th * 7 / 3), (tw * 2 / 7, th / 3)] {
+                let whole = scale(&turned, width, height);
+                // The top-left corner, the middle and the bottom-right corner.
+                let parts = [
+                    (0, 0, width / 3, height / 2),
+                    (width / 4, height / 3, width / 2, height / 3),
+                    (width / 2, height / 2, width - width / 2, height - height / 2),
+                ];
+                for (x, y, w, h) in parts {
+                    let got = scale_part(&image, turns, (width, height), (x, y, w, h));
+                    let want = imageops::crop_imm(&whole, x, y, w, h).to_image();
+                    assert_eq!(got.dimensions(), want.dimensions());
+                    for (px, py, pixel) in got.enumerate_pixels() {
+                        let near = pixel.0.iter().zip(want.get_pixel(px, py).0).all(|(&a, b)| a.abs_diff(b) <= 1);
+                        assert!(
+                            near,
+                            "{turns} turns to {width}x{height}, part {x},{y}: pixel {px},{py} is {pixel:?}, want {:?}",
+                            want.get_pixel(px, py)
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
