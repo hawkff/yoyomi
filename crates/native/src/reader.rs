@@ -22,6 +22,10 @@ const TURN_POINTS: f64 = 12.0;
 const GESTURE_PAUSE: Duration = Duration::from_millis(150);
 /// Points a mouse wheel notch scrolls in webtoon mode.
 const NOTCH_POINTS: f64 = 12.0;
+/// Milliseconds `+` and `-` add to or take from the glide.
+const GLIDE_STEP_MS: i16 = 40;
+/// The longest glide, in milliseconds.
+const MAX_GLIDE_MS: u16 = 600;
 
 /// One book in the window, shown through a pager and a strip of pixels.
 pub(crate) struct Reader {
@@ -85,10 +89,11 @@ impl Reader {
         // Pixel frames lease no kitty ids.
         let resident = Arc::new(Resident::new(ImageIds::with_base(0), false));
         let pager = Pager::new(book.clone(), renderer.clone(), jobs.clone(), resident.clone(), events.clone());
-        let strip = Strip::new(book.clone(), renderer, jobs, resident, events);
+        let mut strip = Strip::new(book.clone(), renderer, jobs, resident, events);
         // The strip keeps the offset within the page itself.
         let (page, zoom) = (state.page.min(book.len().saturating_sub(1)), state.zoom.clamp(1.0, ZOOM_MAX));
-        let state = State { page, zoom, quarter_turns: state.quarter_turns & 3, ..state };
+        let state = State { page, zoom, quarter_turns: state.quarter_turns & 3, glide_ms: state.glide_ms.min(MAX_GLIDE_MS), ..state };
+        strip.set_glide(Duration::from_millis(state.glide_ms.into()));
         Reader {
             book,
             pager,
@@ -182,8 +187,13 @@ impl Reader {
                 self.reset_view();
             }
             "i" => state.invert = !state.invert,
-            "+" | "=" if !webtoon => state.zoom = (state.zoom * ZOOM_STEP).min(ZOOM_MAX),
-            "-" if !webtoon => {
+            // Showing the strip again would drop the scrolling under way.
+            "+" | "=" | "-" if webtoon => {
+                self.glide_by(if key == "-" { -GLIDE_STEP_MS } else { GLIDE_STEP_MS });
+                return None;
+            }
+            "+" | "=" => state.zoom = (state.zoom * ZOOM_STEP).min(ZOOM_MAX),
+            "-" => {
                 state.zoom = (state.zoom / ZOOM_STEP).max(1.0);
                 if state.zoom <= 1.001 {
                     self.reset_view();
@@ -374,6 +384,13 @@ impl Reader {
         self.state.page = (page + delta * step).clamp(0, last) as usize;
         self.state.offset = 0.0;
         self.show();
+    }
+
+    /// `+` and `-` in webtoon mode: a glide `step` milliseconds longer,
+    /// within 0 and `MAX_GLIDE_MS`.
+    fn glide_by(&mut self, step: i16) {
+        self.state.glide_ms = self.state.glide_ms.saturating_add_signed(step).min(MAX_GLIDE_MS);
+        self.strip.set_glide(Duration::from_millis(self.state.glide_ms.into()));
     }
 
     fn reset_view(&mut self) {

@@ -27,11 +27,25 @@ pub struct State {
     pub center: (f64, f64),
     pub spread: bool,
     pub invert: bool,
+    /// How long a move takes in webtoon mode, in milliseconds; 0 moves at
+    /// once.
+    pub glide_ms: u16,
 }
 
 impl Default for State {
     fn default() -> Self {
-        State { page: 0, offset: 0.0, webtoon: false, theater: false, quarter_turns: 0, zoom: 1.0, center: (0.5, 0.5), spread: false, invert: false }
+        State {
+            page: 0,
+            offset: 0.0,
+            webtoon: false,
+            theater: false,
+            quarter_turns: 0,
+            zoom: 1.0,
+            center: (0.5, 0.5),
+            spread: false,
+            invert: false,
+            glide_ms: 280,
+        }
     }
 }
 
