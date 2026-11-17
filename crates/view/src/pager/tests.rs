@@ -458,6 +458,25 @@ fn clear_releases_every_id() {
 }
 
 #[test]
+fn keep_shown_keeps_only_the_frame_on_screen() {
+    let mut rig = rig(RendererKind::Kitty, 5, false);
+    rig.pager.show(request(0, false));
+    rig.settle();
+    // Page 1 shows from the cache and page 2 starts rendering.
+    assert!(rig.pager.show(request(1, false)).shown.is_some());
+    assert!(!rig.pager.running.is_empty());
+    let lease = |rig: &Rig, page: usize| rig.pager.frames.iter().find(|cached| cached.key.page == page).and_then(|cached| cached.lease);
+    let (page0, page1) = (lease(&rig, 0).expect("page 0 is cached"), lease(&rig, 1).expect("page 1 is cached"));
+    rig.pager.keep_shown();
+    assert!(rig.resident.holds(page1) && !rig.resident.holds(page0));
+    assert!(rig.pager.running.is_empty() && rig.pager.frames.len() == 1);
+
+    let again = rig.pager.show(request(1, false));
+    assert!(again.shown.is_some() && again.uploads.is_empty());
+    assert_eq!(rig.renders_of(&[1]), 1, "the kept frame shows without a render");
+}
+
+#[test]
 fn a_frame_whose_id_went_elsewhere_while_rendering_renders_again() {
     let mut rig = rig(RendererKind::Kitty, 5, false);
     rig.pager.show(request(0, false));

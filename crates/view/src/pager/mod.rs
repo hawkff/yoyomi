@@ -244,6 +244,22 @@ impl Pager {
         self.failed.clear();
     }
 
+    /// Drops every frame but those of the request on screen, giving their
+    /// ids back, and stops every job. The request stays, so its frames keep
+    /// their ids while they show, and showing it again renders nothing.
+    pub fn keep_shown(&mut self) {
+        for (_, running) in self.running.drain() {
+            running.cancel.cancel();
+        }
+        let shown: Vec<FrameKey> =
+            self.request.as_ref().map_or_else(Vec::new, |request| self.slots(request).into_iter().map(|slot| slot.key).collect());
+        for i in (0..self.frames.len()).rev() {
+            if !shown.contains(&self.frames[i].key) {
+                self.release(i);
+            }
+        }
+    }
+
     /// The slots of `request`: one page fills the body; in a spread the left
     /// slot takes half the columns but the gap, the right slot the rest after
     /// the gap, and both pages fit the left slot's width. Each page fits its
