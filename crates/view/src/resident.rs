@@ -20,11 +20,12 @@ pub struct Lease {
 /// once given back they leave through `take_freed` only after the frames
 /// that replace them show.
 ///
-/// With a budget, the same rule holds for the bytes the terminal stores: a
-/// lease that passes it takes the least recently shown leases away. Pinned
-/// images and leases taken since the last `pin`, which the frames being
-/// readied draw, are never taken, so only those can keep the terminal past
-/// the budget; nothing else stays past it.
+/// With a budget, the same rule holds for the bytes the terminal stores:
+/// once a frame, `take_freed` takes the least recently shown leases away
+/// until the images fit it. Pinned images, the newest lease and leases taken
+/// since the last `pin`, which the frames being readied draw, are never
+/// taken, so only those can keep the terminal past the budget; nothing else
+/// stays past it.
 pub struct Resident {
     ids: ImageIds,
     resend: bool,
@@ -78,9 +79,7 @@ impl Resident {
     }
 
     /// Claims an id that is not pinned, for an image the terminal stores in
-    /// `bytes`: a free one, or else the least recently shown. Past the
-    /// budget, the least recently shown leases that may go give their ids
-    /// back.
+    /// `bytes`: a free one, or else the least recently shown.
     pub fn lease(&self, bytes: u64) -> Lease {
         let mut state = self.state.lock();
         let id = match self.take_unpinned(&state.pinned) {
@@ -102,20 +101,18 @@ impl Resident {
         state.order.retain(|&held| held != id);
         state.order.push_back(id);
         state.bytes.insert(id, bytes);
-        if let Some(budget) = self.budget {
-            self.make_room(&mut state, budget);
-        }
         Lease { id, generation }
     }
 
     /// Takes leases away, least recently shown first, until what the
-    /// terminal keeps after the next `take_freed` fits `budget`.
+    /// terminal keeps once `take_freed` returns fits `budget`.
     fn make_room(&self, state: &mut State, budget: u64) {
-        let State { leases, order, pinned, freed, bytes, pinned_at, .. } = state;
+        let State { leases, order, pinned, freed, bytes, pinned_at, generation } = state;
         let leaving = |id: &ImageId| !pinned.contains(id) && !leases.contains_key(id);
         let mut held: u64 = bytes.iter().filter(|(id, _)| !(freed.contains(id) && leaving(id))).map(|(_, bytes)| bytes).sum();
         while held > budget {
-            let Some(oldest) = order.iter().position(|id| !pinned.contains(id) && leases[id] <= *pinned_at) else { break };
+            let may_go = |id: &ImageId| !pinned.contains(id) && leases[id] <= *pinned_at && leases[id] != *generation;
+            let Some(oldest) = order.iter().position(may_go) else { break };
             let id = order.remove(oldest).expect("the position is in the order");
             leases.remove(&id);
             freed.insert(id);
@@ -158,9 +155,12 @@ impl Resident {
     /// leased again: no frame on screen draws their images and nobody holds
     /// them. Each comes once; pinned ones wait for a later call, and ones
     /// leased again are dropped, because their next upload replaces the
-    /// image.
+    /// image. Past the budget, the leases that may go are taken first.
     pub fn take_freed(&self) -> Vec<ImageId> {
         let mut state = self.state.lock();
+        if let Some(budget) = self.budget {
+            self.make_room(&mut state, budget);
+        }
         let State { leases, pinned, freed, bytes, .. } = &mut *state;
         let mut taken = Vec::new();
         freed.retain(|id| match (leases.contains_key(id), pinned.contains(id)) {
@@ -300,22 +300,21 @@ mod tests {
         resident.pin([b.id]);
         resident.touch(c);
         let d = resident.lease(30);
-        assert!(!resident.holds(a) && [b, c, d].iter().all(|&lease| resident.holds(lease)), "a went, not the pinned b");
-        assert_eq!(held(), 120, "a counts until it is deleted");
-        assert!(!resident.room(0));
+        assert!(resident.holds(a) && !resident.room(0), "leases go once a frame");
         assert_eq!(resident.take_freed(), [a.id]);
+        assert!(!resident.holds(a) && [b, c, d].iter().all(|&lease| resident.holds(lease)), "a went, not the pinned b");
         assert_eq!(held(), 80);
 
         // The newest lease stays, also alone past the budget, and so does d,
         // leased since the pin for a frame to come.
         let big = resident.lease(500);
-        assert!(!resident.holds(c) && [b, d, big].iter().all(|&lease| resident.holds(lease)));
         assert_eq!(resident.take_freed(), [c.id]);
+        assert!(!resident.holds(c) && [b, d, big].iter().all(|&lease| resident.holds(lease)));
         assert_eq!(held(), 570);
         resident.pin([big.id]);
         let small = resident.lease(10);
-        assert!(!resident.holds(b) && !resident.holds(d) && resident.holds(big) && resident.holds(small));
         let mut freed = resident.take_freed();
+        assert!(!resident.holds(b) && !resident.holds(d) && resident.holds(big) && resident.holds(small));
         freed.sort();
         assert_eq!((freed, held()), (vec![b.id, d.id], 510));
 
