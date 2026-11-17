@@ -39,7 +39,7 @@ Book text: images with kitty or sixel graphics, plain text elsewhere (webtoon ne
   S              screenshot page → PNG (YOYOMI_SHOT_DIR or cwd)
   R              rotate 90° cw
   i              toggle inversion (books: text pages; comics, PDF, DJVU: whole page)
-  + / -          zoom in / out
+  + / -          zoom in / out (webtoon, theater: longer / shorter glide)
   0              reset zoom
   arrows         pan while zoomed · scroll plain-text pages
   /              search: book text, OCR (tesseract) for images · n / p next / prev hit
@@ -530,6 +530,7 @@ pub(crate) mod tests {
         let rows: Vec<String> = (0..40).map(|y| row(&buf, y).trim().to_owned()).collect();
         assert_eq!(rows[3], "yy: terminal reader (.cbz/.cbr/.epub/.fb2/.docx/.doc/.pdf/.djvu)", "{rows:#?}");
         assert!(rows[35].starts_with("Q              save reading positions"), "{rows:#?}");
+        assert!(rows.contains(&"+ / -          zoom in / out (webtoon, theater: longer / shorter glide)".to_owned()), "{rows:#?}");
         assert!(!rows.iter().any(|row| row.starts_with("page ")));
 
         app.rows = 24;

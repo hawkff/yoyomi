@@ -35,7 +35,7 @@ use ratatui::backend::CrosstermBackend;
 use yoyomi_core::{CellSize, ImageIds, Renderer, RendererKind};
 use yoyomi_formats::Opened;
 use yoyomi_render::{Terminal, cell_size, detect, needs_probe, probe};
-use yoyomi_state::{Bookmarks, Positions};
+use yoyomi_state::{Bookmarks, Positions, Settings};
 use yoyomi_view::{Resident, ViewEvent};
 
 use crate::app::{App, Event};
@@ -224,6 +224,7 @@ fn read(books: &[PathBuf], force: Option<RendererKind>) -> ExitCode {
     let size = crossterm::terminal::size().unwrap_or((80, 24));
     let mut app = App::new(renderer.clone(), probed, resident.clone(), Positions::load(), events.clone(), view_events, size);
     app.bookmarks = Bookmarks::load();
+    app.settings = Settings::load();
 
     // Raw mode is the first change to the terminal; there is nothing to restore before it.
     if let Err(error) = enable_raw_mode() {
