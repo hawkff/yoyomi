@@ -22,7 +22,7 @@ pub struct Position {
     pub scroll: f64,
     #[serde(default)]
     pub webtoon: bool,
-    /// In webtoon mode, every page fills the width of the viewport.
+    /// In webtoon mode, every page is scaled to the theater width.
     #[serde(default)]
     pub theater: bool,
 }

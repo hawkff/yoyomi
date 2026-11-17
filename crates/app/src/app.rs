@@ -29,6 +29,9 @@ use crate::shot;
 
 const ZOOM_STEP: f64 = 1.25;
 const ZOOM_MAX: f64 = 8.0;
+/// Percent of the pane's width `[` and `]` take from or add to a theater
+/// page.
+const WIDTH_STEP: u8 = 5;
 /// Milliseconds `+` and `-` add to or take from the glide.
 const GLIDE_STEP_MS: i16 = 40;
 const FRAME_TIME: Duration = Duration::from_nanos(1_000_000_000 / 120);
@@ -206,7 +209,7 @@ pub struct App {
 
     spread: bool,
     webtoon: bool,
-    /// In webtoon mode, every page fills the width of the viewport.
+    /// In webtoon mode, every page is scaled to the theater width.
     theater: bool,
     pub zen: bool,
     pub help: bool,
@@ -657,7 +660,8 @@ impl App {
 
     fn strip_request(&self, i: usize) -> StripRequest {
         let pane = &self.panes[i];
-        StripRequest { grid: self.grid(i), quarter_turns: pane.quarter_turns, invert: pane.invert, fill: self.theater }
+        let fill = self.theater.then_some(self.settings.theater_width);
+        StripRequest { grid: self.grid(i), quarter_turns: pane.quarter_turns, invert: pane.invert, fill }
     }
 
     /// Shows the strip of the active pane, the only one in webtoon mode.
@@ -871,6 +875,11 @@ impl App {
             }
             "t" => self.toggle_strip(false),
             "T" => self.toggle_strip(true),
+            "[" | "]" if self.webtoon && self.theater => {
+                let steps = self.take_count(1);
+                self.widen(key == "]", steps);
+            }
+            "[" | "]" => self.status = "[ and ] set the page width in theater mode (T)".to_owned(),
             "z" => {
                 self.zen = !self.zen;
                 self.sixel_fresh = true;
@@ -918,7 +927,7 @@ impl App {
         }
     }
 
-    /// `t` and `T`: from pages, the strip at the page in view, filling the
+    /// `t` and `T`: from pages, the strip at the page in view, at the theater
     /// width with `theater`; from the strip at the other width, the strip at
     /// this width at the same place; from the strip at this width, pages.
     fn toggle_strip(&mut self, theater: bool) {
@@ -950,6 +959,22 @@ impl App {
                 reader.strip.clear();
             }
             self.show();
+        }
+    }
+
+    /// `[` and `]` in theater mode: pages `steps` times `WIDTH_STEP` percent
+    /// of the pane narrower or `wider`, within `Settings::MIN_THEATER_WIDTH`
+    /// and 100, at the same place and with the scrolling still to run. The
+    /// status bar shows a width under 100 after the mode.
+    fn widen(&mut self, wider: bool, steps: usize) {
+        let (width, delta) = (self.settings.theater_width, steps.min(20) as u8 * WIDTH_STEP);
+        let next = if wider { width.saturating_add(delta) } else { width.saturating_sub(delta) }.clamp(Settings::MIN_THEATER_WIDTH, 100);
+        if next == width {
+            return;
+        }
+        self.settings.theater_width = next;
+        if let Some(place) = self.panes[self.active].reader.as_ref().map(|reader| kept_place(&reader.strip)) {
+            self.show_strip_again(place);
         }
     }
 
@@ -1260,9 +1285,10 @@ impl App {
         let reader = pane.reader.as_ref()?;
         let at = if self.webtoon { reader.strip.position() } else { StripPosition { page: pane.page, offset: 0.0 } };
         let (quarter_turns, zoom, center, invert) = (pane.quarter_turns, pane.zoom, pane.center, pane.invert);
-        let (webtoon, theater, spread, glide_ms) = (self.webtoon, self.theater, self.spread && !self.split, self.settings.glide_ms);
-        let state =
-            yoyomi_native::State { page: at.page, offset: at.offset, webtoon, theater, quarter_turns, zoom, center, spread, invert, glide_ms };
+        let (webtoon, theater, spread) = (self.webtoon, self.theater, self.spread && !self.split);
+        let (glide_ms, theater_width) = (self.settings.glide_ms, self.settings.theater_width);
+        let (page, offset) = (at.page, at.offset);
+        let state = yoyomi_native::State { page, offset, webtoon, theater, quarter_turns, zoom, center, spread, invert, glide_ms, theater_width };
         Some((reader.book.clone(), state))
     }
 
@@ -1276,7 +1302,7 @@ impl App {
 
     /// Acts on how the native window closed. A window that failed to open
     /// leaves the panes as `f` found them; one that closed leaves its glide
-    /// time to the strips and the saved settings.
+    /// time and its theater width to the strips and the saved settings.
     fn native_done(&mut self, before: yoyomi_native::State, outcome: yoyomi_core::Result<yoyomi_native::Outcome>) -> Option<String> {
         let outcome = match outcome {
             Ok(outcome) => outcome,
@@ -1287,6 +1313,7 @@ impl App {
         };
         let state = outcome.state;
         self.settings.glide_ms = state.glide_ms.min(Settings::MAX_GLIDE_MS);
+        self.settings.theater_width = state.theater_width.clamp(Settings::MIN_THEATER_WIDTH, 100);
         let glide = self.glide();
         for reader in self.panes.iter_mut().filter_map(|pane| pane.reader.as_mut()) {
             reader.strip.set_glide(glide);
@@ -1675,6 +1702,9 @@ impl App {
         let mut left = format!(" {}", self.renderer.kind().name());
         if self.webtoon {
             left = format!("{left}  ·  {}", self.strip_mode().0);
+            if self.theater && self.settings.theater_width < 100 {
+                left = format!("{left} {}%", self.settings.theater_width);
+            }
             if self.slides() {
                 left = match self.settings.glide_ms {
                     0 => format!("{left}  ·  glide off"),
@@ -2052,7 +2082,7 @@ pub(crate) mod tests {
         let (_, state) = app.native_state().expect("an open book");
         assert_eq!((state.webtoon, state.theater), (true, false));
 
-        let mode = |app: &App| (app.webtoon, app.theater, app.strip_request(0).fill);
+        let mode = |app: &App| (app.webtoon, app.theater, app.strip_request(0).fill.is_some());
         let theater = yoyomi_native::State { page: 3, offset: 0.5, webtoon: true, theater: true, ..yoyomi_native::State::default() };
         app.native_return(theater.clone());
         assert_eq!(mode(&app), (true, true, true));
@@ -3004,7 +3034,7 @@ pub(crate) mod tests {
     #[test]
     fn t_and_big_t_switch_between_pages_webtoon_and_theater_mode() {
         let (mut app, views) = webtoon_reader(false);
-        let mode = |app: &App| (app.webtoon, app.theater, app.strip_request(0).fill);
+        let mode = |app: &App| (app.webtoon, app.theater, app.strip_request(0).fill.is_some());
         let settle = |app: &mut App| run_views(app, &views, |app| !app.panes[0].loading && app.deadline().is_none());
         keys(&mut app, "j");
         settle(&mut app);
@@ -3078,7 +3108,7 @@ pub(crate) mod tests {
             app.positions.set(&key, Position { page: 2, offset: 0.5, scroll: 0.0, webtoon, theater });
             let Ok(Opened::Book(book)) = yoyomi_formats::open(&path) else { panic!("the fixture opens as a comic") };
             deliver(&mut app, 0, path.to_str().expect("a UTF-8 path"), Ok(book));
-            assert_eq!((app.webtoon, app.theater, app.strip_request(0).fill), (webtoon, restored, restored), "{webtoon} {theater}");
+            assert_eq!((app.webtoon, app.theater, app.strip_request(0).fill.is_some()), (webtoon, restored, restored), "{webtoon} {theater}");
             if webtoon {
                 assert_near(strip_place(&app).0, StripPosition { page: 2, offset: 0.5 }, "the restore");
             }
@@ -3135,6 +3165,75 @@ pub(crate) mod tests {
         // Pages zoom.
         assert_eq!(status(&mut app, "T+"), " native");
         assert_eq!((app.settings.glide_ms, app.panes[0].zoom), (560, ZOOM_STEP));
+    }
+
+    #[test]
+    fn brackets_set_the_width_of_theater_pages_at_the_same_place() {
+        let (mut app, views) = sliding_reader();
+        let status = |app: &mut App, pressed: &str| {
+            keys(app, pressed);
+            app.status_left()
+        };
+        // Pages and webtoon mode say where the keys work.
+        for mode in ["", "t"] {
+            keys(&mut app, mode);
+            for key in ["[", "]"] {
+                assert!(status(&mut app, key).ends_with("[ and ] set the page width in theater mode (T)"), "{mode}{key}");
+            }
+            assert_eq!((app.settings.theater_width, app.strip_request(0).fill), (100, None), "{mode}");
+        }
+        assert_eq!(status(&mut app, "T"), " native  ·  theater  ·  glide 280 ms");
+        assert_eq!(status(&mut app, "]"), " native  ·  theater  ·  glide 280 ms", "no wider than the pane");
+        assert_eq!(status(&mut app, "["), " native  ·  theater 95%  ·  glide 280 ms");
+        assert_eq!(app.strip_request(0).fill, Some(95));
+
+        // The width changes at the same place, with the scroll still to run.
+        let settle = |app: &mut App| run_views(app, &views, |app| !app.panes[0].loading && app.deadline().is_none());
+        settle(&mut app);
+        keys(&mut app, "J");
+        settle(&mut app);
+        let before = strip_place(&app).0;
+        keys(&mut app, "j");
+        let pending = strip_place(&app).1;
+        assert!(before.offset > 0.0 && pending > 0.0);
+        keys(&mut app, "[");
+        assert_near(strip_place(&app).0, before, "[");
+        assert_eq!((strip_place(&app).1, app.strip_request(0).fill), (pending, Some(90)));
+        settle(&mut app);
+
+        // A count takes as many steps and is used up.
+        keys(&mut app, "3]");
+        assert_eq!((app.settings.theater_width, app.count.as_str()), (100, ""));
+        keys(&mut app, "3[");
+        assert_eq!((app.settings.theater_width, app.count.as_str()), (85, ""));
+        keys(&mut app, &"[".repeat(20));
+        assert_eq!(app.settings.theater_width, Settings::MIN_THEATER_WIDTH);
+        assert_eq!(status(&mut app, "]"), " native  ·  theater 35%  ·  glide 280 ms");
+        // Webtoon mode keeps its own width, and theater mode comes back at the last one.
+        assert_eq!((status(&mut app, "t"), app.strip_request(0).fill), (" native  ·  webtoon  ·  glide 280 ms".to_owned(), None));
+        keys(&mut app, "T");
+        assert_eq!(app.strip_request(0).fill, Some(35));
+    }
+
+    #[test]
+    fn a_changed_theater_width_is_saved_and_goes_to_the_window_and_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let (mut app, _views) = sliding_reader();
+        app.settings = Settings::load_from(Some(path.clone()));
+        keys(&mut app, "T[[");
+        let (_, state) = app.native_state().expect("an open book");
+        assert_eq!(state.theater_width, 90);
+        // The window's width comes back, within the bounds.
+        for (theater_width, kept) in [(70, 70), (5, Settings::MIN_THEATER_WIDTH), (250, 100)] {
+            let state = yoyomi_native::State { webtoon: true, theater: true, theater_width, ..yoyomi_native::State::default() };
+            let outcome = yoyomi_native::Outcome { state, action: yoyomi_native::Action::Return, error: None };
+            app.native_done(yoyomi_native::State::default(), Ok(outcome));
+            assert_eq!((app.settings.theater_width, app.strip_request(0).fill), (kept, Some(kept)), "{theater_width}");
+        }
+        keys(&mut app, "[q");
+        assert_eq!(app.finish(), None);
+        assert_eq!(Settings::load_from(Some(path)).theater_width, 95);
     }
 
     #[test]

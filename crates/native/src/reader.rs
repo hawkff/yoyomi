@@ -26,6 +26,11 @@ const NOTCH_POINTS: f64 = 12.0;
 const GLIDE_STEP_MS: i16 = 40;
 /// The longest glide, in milliseconds.
 const MAX_GLIDE_MS: u16 = 600;
+/// Percent of the view's width `[` and `]` take from or add to a theater
+/// page.
+const WIDTH_STEP: u8 = 5;
+/// The narrowest theater page, in percent of the view's width.
+const MIN_WIDTH: u8 = 30;
 
 /// One book in the window, shown through a pager and a strip of pixels.
 pub(crate) struct Reader {
@@ -92,7 +97,8 @@ impl Reader {
         let mut strip = Strip::new(book.clone(), renderer, jobs, resident, events);
         // The strip keeps the offset within the page itself.
         let (page, zoom) = (state.page.min(book.len().saturating_sub(1)), state.zoom.clamp(1.0, ZOOM_MAX));
-        let state = State { page, zoom, quarter_turns: state.quarter_turns & 3, glide_ms: state.glide_ms.min(MAX_GLIDE_MS), ..state };
+        let (glide_ms, theater_width) = (state.glide_ms.min(MAX_GLIDE_MS), state.theater_width.clamp(MIN_WIDTH, 100));
+        let state = State { page, zoom, quarter_turns: state.quarter_turns & 3, glide_ms, theater_width, ..state };
         strip.set_glide(Duration::from_millis(state.glide_ms.into()));
         Reader {
             book,
@@ -204,8 +210,8 @@ impl Reader {
             "down" if zoomed && !webtoon => self.pan(0.0, 1.0),
             "left" if zoomed && !webtoon => self.pan(-1.0, 0.0),
             "right" if zoomed && !webtoon => self.pan(1.0, 0.0),
-            // From pages, the strip at the page in view, filling the width
-            // with `T`; from the strip at the other width, this width at the
+            // From pages, the strip at the page in view, at the theater
+            // width with `T`; from the strip at the other width, this width at the
             // same place; from the strip at this width, pages at the page on
             // top.
             "t" | "T" => {
@@ -222,6 +228,23 @@ impl Reader {
                 self.state.spread = false;
                 self.reset_view();
                 self.strip_shown = false;
+            }
+            // The strip a step narrower or wider, or a step for each of a
+            // count, at the same place and with the scrolling still to run.
+            "[" | "]" if webtoon && state.theater => {
+                let delta = self.count.take().unwrap_or(1).min(20) as u8 * WIDTH_STEP;
+                let width = if key == "[" { state.theater_width.saturating_sub(delta) } else { state.theater_width.saturating_add(delta) };
+                let width = width.clamp(MIN_WIDTH, 100);
+                if width == state.theater_width {
+                    return None;
+                }
+                let (at, pending, carry) = (self.at(), self.strip.pending(), self.strip.carry());
+                (self.state.page, self.state.offset, self.state.theater_width) = (at.page, at.offset, width);
+                self.strip_shown = false;
+                self.show();
+                self.strip.scroll(pending);
+                self.strip.keep_carry(carry);
+                return None;
             }
             "R" => state.quarter_turns = (state.quarter_turns + 1) & 3,
             // A count names a one-based page for both.
@@ -326,7 +349,8 @@ impl Reader {
         let Some(grid) = self.size else { return };
         let state = &self.state;
         if state.webtoon {
-            let request = StripRequest { grid, quarter_turns: state.quarter_turns, invert: state.invert, fill: state.theater };
+            let fill = state.theater.then_some(state.theater_width);
+            let request = StripRequest { grid, quarter_turns: state.quarter_turns, invert: state.invert, fill };
             let update = self.strip.show(self.at(), request);
             self.strip_shown = true;
             self.apply(update, true);
