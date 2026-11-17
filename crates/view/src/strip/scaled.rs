@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use yoyomi_core::{Book, Cancel, Error, PageCache, PageKind, Pixels, Result, RgbaImage};
+use yoyomi_core::{Book, Cancel, Error, PageCache, PageKind, Pixels, Result, RgbaImage, check_size};
 use yoyomi_render::{invert, rotate, scale};
 
 /// One page as the strip draws it: turned, scaled to `width` x `height` and
@@ -127,6 +127,8 @@ impl State {
 /// Decodes, turns, scales and inverts one page, copying it only when one of
 /// those changes it.
 fn scale_page(book: &PageCache, key: Key, cancel: &Cancel) -> Result<Pixels> {
+    // Filling a wide viewport can enlarge a page far past its decoded size.
+    check_size(key.width, key.height)?;
     let page = book.page(key.page, cancel)?;
     let turned = (key.quarter_turns & 3 != 0).then(|| rotate(&page, key.quarter_turns));
     let source = turned.as_ref().unwrap_or(&page);

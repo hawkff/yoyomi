@@ -106,16 +106,11 @@ struct Pane {
     center: (f64, f64),
     /// Rows a plain-text page scrolled down.
     text_top: usize,
-    /// The part of the page theater mode shows: 0 its top, 1 its bottom.
-    part: f64,
     /// The frame on screen, kept until a newer one arrives.
     shown: Option<Shown>,
     /// The zoom and center the shown frame was rendered with; keys change
     /// `zoom` and `center` before their frame arrives.
     shown_crop: (f64, (f64, f64)),
-    /// Whether the shown frame holds a part of its page, as theater mode
-    /// renders it; `T` changes the mode before its frame arrives.
-    shown_part: bool,
     /// Under tmux, the uploads of the images `shown` draws, which a frame
     /// sends whenever it draws them anew.
     uploads: Vec<Upload>,
@@ -137,10 +132,8 @@ impl Default for Pane {
             zoom: 1.0,
             center: (0.5, 0.5),
             text_top: 0,
-            part: 0.0,
             shown: None,
             shown_crop: (1.0, (0.5, 0.5)),
-            shown_part: false,
             uploads: Vec::new(),
             loading: false,
             chapters: None,
@@ -153,7 +146,6 @@ impl Pane {
         self.zoom = 1.0;
         self.center = (0.5, 0.5);
         self.text_top = 0;
-        self.part = 0.0;
     }
 
     /// How the pane turns, zooms and inverts its pages, without selection
@@ -211,7 +203,7 @@ pub struct App {
 
     spread: bool,
     webtoon: bool,
-    /// Pages fill the width of their pane and show one part at a time.
+    /// In webtoon mode, every page fills the width of the viewport.
     theater: bool,
     pub zen: bool,
     pub help: bool,
@@ -376,8 +368,8 @@ impl App {
             && let Some(saved) = &saved
         {
             self.webtoon = saved.webtoon;
+            self.theater = saved.webtoon && saved.theater;
             self.spread &= !saved.webtoon;
-            self.theater &= !saved.webtoon;
         }
         let (page, offset, scroll) = match (page, saved) {
             (Some(page), _) => (page, 0.0, 0.0),
@@ -649,15 +641,18 @@ impl App {
         let transform = Transform { highlights, ..pane.transform() };
         let body = self.body_box(i);
         let grid = Grid::new(body.cols, body.rows);
-        let fill = self.theater.then_some(pane.part);
-        PageRequest { page: pane.page, spread, grid, margin: self.margin(), transform, selected_page, text_top: pane.text_top, fill }
+        PageRequest { page: pane.page, spread, grid, margin: self.margin(), transform, selected_page, text_top: pane.text_top }
+    }
+
+    fn strip_request(&self, i: usize) -> StripRequest {
+        let pane = &self.panes[i];
+        StripRequest { grid: self.grid(i), quarter_turns: pane.quarter_turns, invert: pane.invert, fill: self.theater }
     }
 
     /// Shows the strip of the active pane, the only one in webtoon mode.
     fn show_strip(&mut self, at: StripPosition) {
         let i = self.active;
-        let pane = &self.panes[i];
-        let request = StripRequest { grid: self.grid(i), quarter_turns: pane.quarter_turns, invert: pane.invert };
+        let request = self.strip_request(i);
         let Some(reader) = &mut self.panes[i].reader else { return };
         let update = reader.strip.show(at, request);
         self.apply(update);
@@ -699,7 +694,7 @@ impl App {
             self.uploads.extend(uploads);
         }
         self.sixel_fresh = self.sixel_fresh || shown.scene.layers.iter().any(|layer| matches!(layer, Layer::Sixel { .. }));
-        let (spread, theater) = (self.spread && !self.split, self.theater);
+        let spread = self.spread && !self.split;
         let pane = &mut self.panes[i];
         if let Some(reader) = &mut pane.reader {
             if pane.shown.as_ref().is_some_and(|old| old.page != shown.page) {
@@ -707,9 +702,8 @@ impl App {
             }
             reader.select.on_frame(&[shown.page, shown.page + usize::from(spread)]);
         }
-        // The views send frames of their latest request only, which the current zoom, center and mode made.
+        // The views send frames of their latest request only, which the current zoom and center made.
         pane.shown_crop = (pane.zoom, pane.center);
-        pane.shown_part = theater;
         pane.page = shown.page;
         pane.loading = false;
         pane.error = None;
@@ -825,11 +819,8 @@ impl App {
             }
             "s" => {
                 if self.webtoon {
-                    self.status = "spread is unavailable in webtoon mode (t to leave)".to_owned();
-                    return;
-                }
-                if self.theater {
-                    self.status = "spread is unavailable in theater mode (T to leave)".to_owned();
+                    let (mode, leave) = self.strip_mode();
+                    self.status = format!("spread is unavailable in {mode} mode ({leave} to leave)");
                     return;
                 }
                 if self.split {
@@ -839,33 +830,8 @@ impl App {
                 self.spread = !self.spread;
                 self.show();
             }
-            "T" => {
-                if self.webtoon {
-                    self.status = "theater mode is unavailable in webtoon mode (t to leave)".to_owned();
-                    return;
-                }
-                self.theater = !self.theater;
-                self.spread = false;
-                for pane in &mut self.panes {
-                    pane.reset_view();
-                }
-                self.show_all();
-            }
-            "t" => {
-                if self.split {
-                    self.status = "webtoon mode needs a single pane (v to unsplit)".to_owned();
-                    return;
-                }
-                self.webtoon = !self.webtoon;
-                self.spread = false;
-                self.theater = false;
-                self.panes[active].reset_view();
-                if self.webtoon {
-                    self.show_strip(StripPosition { page: self.panes[active].page, offset: 0.0 });
-                } else {
-                    self.show();
-                }
-            }
+            "t" => self.toggle_strip(false),
+            "T" => self.toggle_strip(true),
             "z" => {
                 self.zen = !self.zen;
                 self.sixel_fresh = true;
@@ -876,7 +842,10 @@ impl App {
                     self.active = 1 - self.active;
                 }
             }
-            "v" | "O" if self.webtoon => self.status = "split is unavailable in webtoon mode (t to leave)".to_owned(),
+            "v" | "O" if self.webtoon => {
+                let (mode, leave) = self.strip_mode();
+                self.status = format!("split is unavailable in {mode} mode ({leave} to leave)");
+            }
             "v" => self.toggle_split(),
             "O" => {
                 if !self.split {
@@ -908,6 +877,39 @@ impl App {
         }
     }
 
+    /// `t` and `T`: from pages, the strip at the page in view, filling the
+    /// width with `theater`; from the strip at the other width, the strip at
+    /// this width at the same place; from the strip at this width, pages.
+    fn toggle_strip(&mut self, theater: bool) {
+        if self.split {
+            let mode = if theater { "theater" } else { "webtoon" };
+            self.status = format!("{mode} mode needs a single pane (v to unsplit)");
+            return;
+        }
+        let active = self.active;
+        self.spread = false;
+        if self.webtoon && self.theater != theater {
+            self.theater = theater;
+            if let Some(at) = self.panes[active].reader.as_ref().map(|reader| reader.strip.position()) {
+                self.show_strip(at);
+            }
+            return;
+        }
+        self.webtoon = !self.webtoon;
+        self.theater = theater && self.webtoon;
+        self.panes[active].reset_view();
+        if self.webtoon {
+            self.show_strip(StripPosition { page: self.panes[active].page, offset: 0.0 });
+        } else {
+            self.show();
+        }
+    }
+
+    /// The name of the strip's mode, and the key that leaves it.
+    fn strip_mode(&self) -> (&'static str, char) {
+        if self.theater { ("theater", 'T') } else { ("webtoon", 't') }
+    }
+
     fn take_count(&mut self, default: usize) -> usize {
         let count = std::mem::take(&mut self.count);
         count.parse().ok().filter(|&n| n >= 1).unwrap_or(default)
@@ -922,32 +924,9 @@ impl App {
         }
     }
 
-    /// Theater mode: moves pane `i` by `delta` parts of its page, and past
-    /// the page's last or first part to the next or previous page.
-    fn step(&mut self, i: usize, delta: isize) {
-        let request = self.page_request(i);
-        let pane = &mut self.panes[i];
-        let Some(reader) = &pane.reader else { return };
-        // A page still rendering has parts nobody knows yet; the step waits
-        // for it instead of passing the page by.
-        let Some((page, part)) = reader.pager.step(&request, delta) else { return };
-        if (page, part) == (pane.page, pane.part) {
-            return;
-        }
-        if page != pane.page {
-            pane.reset_view();
-        }
-        (pane.page, pane.part) = (page, part);
-        self.show_pane(i);
-    }
-
     /// Turns pane `i` by `delta` pages or spreads; in webtoon mode it scrolls
-    /// `delta` times `fraction` of the viewport, and in theater mode it moves
-    /// `delta` parts.
+    /// `delta` times `fraction` of the viewport.
     fn turn(&mut self, i: usize, delta: isize, fraction: f64) {
-        if self.theater {
-            return self.step(i, delta);
-        }
         let rows = scroll_distance(self.image_box(i).rows, fraction);
         let spread = self.spread && !self.split;
         let pane = &mut self.panes[i];
@@ -976,7 +955,7 @@ impl App {
             self.show_strip(StripPosition { page, offset: 0.0 });
             return;
         }
-        if page == pane.page && pane.shown.is_some() && pane.part == 0.0 {
+        if page == pane.page && pane.shown.is_some() {
             return;
         }
         pane.page = page;
@@ -1002,12 +981,12 @@ impl App {
     }
 
     fn zoom_by(&mut self, factor: f64) {
-        if self.webtoon {
-            self.status = "webtoon mode fits pages to the viewport width".to_owned();
+        if self.theater {
+            self.status = "theater mode fills the viewport width".to_owned();
             return;
         }
-        if self.theater {
-            self.status = "theater mode fits pages to the pane width".to_owned();
+        if self.webtoon {
+            self.status = "webtoon mode fits pages to the viewport width".to_owned();
             return;
         }
         self.change(|pane| {
@@ -1107,15 +1086,14 @@ impl App {
         self.select_outcome(i, outcome);
     }
 
-    /// The pages of pane `i` under the mouse. Webtoon mode, a part of a page
-    /// in theater mode and turned pages have none, and half blocks show text
-    /// pages as text, which the terminal selects.
+    /// The pages of pane `i` under the mouse. Webtoon mode and turned pages
+    /// have none, and half blocks show text pages as text, which the terminal
+    /// selects.
     fn select_view(&self, i: usize) -> select::View {
         let pane = &self.panes[i];
         let mut slots = Vec::new();
         if let (Some(reader), Some(shown)) = (&pane.reader, &pane.shown)
             && !self.webtoon
-            && !pane.shown_part
             && pane.quarter_turns == 0
         {
             let text_images = self.renderer.kind() != RendererKind::HalfBlock;
@@ -1185,22 +1163,29 @@ impl App {
             self.status = "native reader is unavailable in this build".to_owned();
             return;
         }
-        let pane = &self.panes[self.active];
-        let Some(reader) = &pane.reader else {
+        let Some(native) = self.native_state() else {
             self.status = "no book in this pane".to_owned();
             return;
         };
-        let at = if self.webtoon { reader.strip.position() } else { StripPosition { page: pane.page, offset: 0.0 } };
-        let (quarter_turns, zoom, center, invert) = (pane.quarter_turns, pane.zoom, pane.center, pane.invert);
-        let spread = self.spread && !self.split;
-        let state = yoyomi_native::State { page: at.page, offset: at.offset, webtoon: self.webtoon, quarter_turns, zoom, center, spread, invert };
-        self.native = Some((reader.book.clone(), state));
+        self.native = Some(native);
         self.cancel_searches();
         for reader in self.panes.iter_mut().filter_map(|pane| pane.reader.as_mut()) {
             reader.select.end_press();
             reader.pager.clear();
             reader.strip.clear();
         }
+    }
+
+    /// The active pane's book and the state `f` hands the native window with
+    /// it.
+    fn native_state(&self) -> Option<(Arc<PageCache>, yoyomi_native::State)> {
+        let pane = &self.panes[self.active];
+        let reader = pane.reader.as_ref()?;
+        let at = if self.webtoon { reader.strip.position() } else { StripPosition { page: pane.page, offset: 0.0 } };
+        let (quarter_turns, zoom, center, invert) = (pane.quarter_turns, pane.zoom, pane.center, pane.invert);
+        let (webtoon, theater, spread) = (self.webtoon, self.theater, self.spread && !self.split);
+        let state = yoyomi_native::State { page: at.page, offset: at.offset, webtoon, theater, quarter_turns, zoom, center, spread, invert };
+        Some((reader.book.clone(), state))
     }
 
     /// Runs the native window `f` asked for, then takes back its state or
@@ -1226,7 +1211,8 @@ impl App {
             yoyomi_native::Action::Return => self.native_return(state),
             yoyomi_native::Action::Save => {
                 let offset = if state.webtoon { state.offset } else { 0.0 };
-                self.native_save = Some(Position { page: state.page, offset, scroll: 0.0, webtoon: state.webtoon });
+                let theater = state.webtoon && state.theater;
+                self.native_save = Some(Position { page: state.page, offset, scroll: 0.0, webtoon: state.webtoon, theater });
                 self.quit = Some(Quit::Save);
             }
             yoyomi_native::Action::Clear => self.quit = Some(Quit::Clear),
@@ -1235,23 +1221,18 @@ impl App {
     }
 
     /// Gives the active pane the native window's state: webtoon mode only
-    /// without a split, a spread only without a split or webtoon mode. Either
-    /// one ends theater mode. Every pane renders and uploads again.
+    /// without a split, theater mode only with webtoon mode, a spread only
+    /// without a split or webtoon mode. Every pane renders and uploads again.
     fn native_return(&mut self, state: yoyomi_native::State) {
         self.webtoon = state.webtoon && !self.split;
+        self.theater = state.theater && self.webtoon;
         self.spread = state.spread && !self.split && !self.webtoon;
-        self.theater &= !self.webtoon && !self.spread;
         let pane = &mut self.panes[self.active];
         if pane.page != state.page {
             pane.text_top = 0;
-            pane.part = 0.0;
         }
         (pane.page, pane.quarter_turns, pane.invert, pane.zoom, pane.center) =
             (state.page, state.quarter_turns, state.invert, state.zoom, state.center);
-        if self.theater {
-            // Theater mode shows whole pages, and its keys could not undo a zoom.
-            (pane.zoom, pane.center) = (1.0, (0.5, 0.5));
-        }
         for pane in &mut self.panes {
             // Kitty ids in the old scenes may already name other images.
             pane.shown = None;
@@ -1607,9 +1588,7 @@ impl App {
     pub fn status_left(&self) -> String {
         let mut left = format!(" {}", self.renderer.kind().name());
         if self.webtoon {
-            left.push_str("  ·  webtoon");
-        } else if self.theater {
-            left.push_str("  ·  theater");
+            left = format!("{left}  ·  {}", self.strip_mode().0);
         }
         let search = self.search().and_then(|(_, search)| search::progress(search)).unwrap_or_default();
         let port = self.web.port().map(|port| format!(":{port}")).unwrap_or_default();
@@ -1640,7 +1619,9 @@ impl App {
             match self.quit {
                 Some(Quit::Save) if self.webtoon => {
                     let at = reader.strip.position();
-                    self.positions.set(key, Position { page: at.page, offset: at.offset, scroll: reader.strip.pending(), webtoon: true });
+                    let position =
+                        Position { page: at.page, offset: at.offset, scroll: reader.strip.pending(), webtoon: true, theater: self.theater };
+                    self.positions.set(key, position);
                 }
                 Some(Quit::Save) => self.positions.set(key, Position { page: *page, ..Position::default() }),
                 _ => self.positions.delete(key),
@@ -1925,94 +1906,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn theater_keys_step_through_a_page_before_turning_it() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        /// Three rendered pages 78 pixels wide and 105 tall, which decode
-        /// once the flag is set. The 78 x 21 box of an 80 x 24 screen shows
-        /// 42 of their rows at full width, so each page has three parts.
-        struct Tall(Arc<AtomicBool>);
-        impl Book for Tall {
-            fn path(&self) -> &Path {
-                Path::new("/books/tall.cbz")
-            }
-            fn title(&self) -> &str {
-                "Tall"
-            }
-            fn len(&self) -> usize {
-                3
-            }
-            fn kind(&self, _page: usize) -> PageKind {
-                PageKind::Rendered
-            }
-            fn page(&self, _page: usize, cancel: &Cancel) -> Result<Pixels> {
-                while !self.0.load(Ordering::SeqCst) {
-                    cancel.check()?;
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Ok(Arc::new(RgbaImage::new(78, 105)))
-            }
-        }
-        let (events, _) = unbounded();
-        let (view_events, views) = unbounded();
-        let resident = Arc::new(Resident::new(ImageIds::with_base(0x100), false));
-        let renderer = Arc::new(HalfBlock::new(CellSize::FALLBACK));
-        let mut app = App::new(renderer, Terminal::default(), resident, Positions::load_from(None), events, view_events, (80, 24));
-        let decodes = Arc::new(AtomicBool::new(false));
-        deliver(&mut app, 0, "/books/tall.cbz", Ok(Arc::new(Tall(decodes.clone()))));
-        let place = |app: &App| (app.panes[0].page, app.panes[0].part);
-        let press = |app: &mut App, pressed: &str| {
-            keys(app, pressed);
-            run_views(app, &views, |app| !app.panes[0].loading);
-            place(app)
-        };
-
-        keys(&mut app, "Tj");
-        assert_eq!(place(&app), (0, 0.0), "a step waits for a page that still renders");
-        assert!(app.status_left().ends_with("  ·  theater"), "{}", app.status_left());
-        decodes.store(true, Ordering::SeqCst);
-        run_views(&mut app, &views, |app| !app.panes[0].loading);
-
-        for (pressed, want) in [
-            ("j", (0, 0.5)),
-            ("J", (0, 1.0)),
-            ("j", (1, 0.0)),
-            ("k", (0, 1.0)),
-            ("3j", (2, 0.0)),
-            ("j", (2, 0.5)),
-            ("j", (2, 1.0)),
-            ("j", (2, 1.0)),
-            ("g", (0, 0.0)),
-            ("jg", (0, 0.0)),
-            ("j0", (0, 0.0)),
-            ("K", (0, 0.0)),
-        ] {
-            assert_eq!(press(&mut app, pressed), want, "after {pressed}");
-        }
-        let wheel = Event::Input(Input::Mouse(MouseEvent { kind: MouseEventKind::ScrollDown, column: 0, row: 0, modifiers: KeyModifiers::NONE }));
-        app.on_event(wheel);
-        assert_eq!(place(&app), (0, 0.5), "the wheel steps too");
-        assert!(app.select_view(0).slots.is_empty(), "a part of a page takes no selection");
-
-        keys(&mut app, "s");
-        assert!(app.status_left().ends_with("spread is unavailable in theater mode (T to leave)") && !app.spread);
-        keys(&mut app, "+");
-        assert!(app.status_left().ends_with("theater mode fits pages to the pane width") && app.panes[0].zoom == 1.0);
-
-        keys(&mut app, "T");
-        assert_eq!((app.theater, app.page_request(0).fill), (false, None));
-        assert!(app.select_view(0).slots.is_empty(), "nor does the part still on screen while the page renders");
-        run_views(&mut app, &views, |app| !app.panes[0].loading);
-        assert_eq!(place(&app), (0, 0.0), "leaving theater mode shows the page whole");
-        assert!(!app.select_view(0).slots.is_empty(), "a whole page does");
-        assert_eq!(press(&mut app, "j"), (1, 0.0), "pages turn again");
-        keys(&mut app, "Tt");
-        assert!(app.webtoon && !app.theater, "webtoon mode ends theater mode");
-        keys(&mut app, "T");
-        assert!(app.status_left().ends_with("theater mode is unavailable in webtoon mode (t to leave)") && !app.theater);
-    }
-
-    #[test]
     fn f_hands_the_active_pane_to_the_native_window() {
         let (mut app, _) = app_with(Arc::new(HalfBlock::new(CellSize::FALLBACK)), 80, 24);
         keys(&mut app, "f");
@@ -2047,21 +1940,41 @@ pub(crate) mod tests {
         assert_eq!(message.as_deref(), Some("native reader: no window"));
         assert_eq!((app.panes[0].page, app.spread), (3, false));
 
-        // Theater mode stays through the window without its zoom, and a spread ends it.
-        app.theater = true;
-        app.panes[0].part = 0.5;
-        app.native_return(yoyomi_native::State { page: 3, zoom: 2.0, center: (0.2, 0.2), ..yoyomi_native::State::default() });
-        let pane = &app.panes[0];
-        assert_eq!((app.theater, pane.part, pane.zoom, pane.center), (true, 0.5, 1.0, (0.5, 0.5)));
-        app.native_return(yoyomi_native::State { page: 4, spread: true, ..yoyomi_native::State::default() });
-        assert_eq!((app.theater, app.spread, app.panes[0].part), (false, true, 0.0));
-        app.native_return(yoyomi_native::State::default());
-
         let state = yoyomi_native::State { page: 4, offset: 0.25, webtoon: true, ..yoyomi_native::State::default() };
         let outcome = yoyomi_native::Outcome { state, action: yoyomi_native::Action::Save, error: Some("page 5: broken".into()) };
         assert_eq!(app.native_done(yoyomi_native::State::default(), Ok(outcome)).as_deref(), Some("native reader: page 5: broken"));
         assert_eq!(app.quit, Some(Quit::Save));
-        assert_eq!(app.native_save, Some(Position { page: 4, offset: 0.25, scroll: 0.0, webtoon: true }));
+        assert_eq!(app.native_save, Some(Position { page: 4, offset: 0.25, scroll: 0.0, webtoon: true, theater: false }));
+    }
+
+    #[test]
+    fn theater_mode_goes_to_the_native_window_and_back() {
+        let mut app = reader(10);
+        keys(&mut app, "T");
+        let (_, state) = app.native_state().expect("an open book");
+        assert_eq!((state.webtoon, state.theater), (true, true));
+        keys(&mut app, "t");
+        let (_, state) = app.native_state().expect("an open book");
+        assert_eq!((state.webtoon, state.theater), (true, false));
+
+        let mode = |app: &App| (app.webtoon, app.theater, app.strip_request(0).fill);
+        let theater = yoyomi_native::State { page: 3, offset: 0.5, webtoon: true, theater: true, ..yoyomi_native::State::default() };
+        app.native_return(theater.clone());
+        assert_eq!(mode(&app), (true, true, true));
+        assert_near(strip_place(&app).0, StripPosition { page: 3, offset: 0.5 }, "the return");
+        app.native_return(yoyomi_native::State { webtoon: false, ..theater.clone() });
+        assert_eq!(mode(&app), (false, false, false), "theater mode needs webtoon mode");
+        app.split = true;
+        app.native_return(theater.clone());
+        assert_eq!(mode(&app), (false, false, false), "nor in a split");
+        app.split = false;
+
+        for (webtoon, saved) in [(true, true), (false, false)] {
+            let state = yoyomi_native::State { webtoon, ..theater.clone() };
+            let outcome = yoyomi_native::Outcome { state, action: yoyomi_native::Action::Save, error: None };
+            app.native_done(yoyomi_native::State::default(), Ok(outcome));
+            assert_eq!(app.native_save.take().map(|position| (position.webtoon, position.theater)), Some((webtoon, saved)));
+        }
     }
 
     #[test]
@@ -2418,10 +2331,13 @@ pub(crate) mod tests {
         app.quit = Some(Quit::Save);
         app.finish();
         let path = fixture("webtoon.cbz");
-        assert_eq!(app.positions.get(&BookKey::new(&path)), Some(Position { page: at.page, offset: at.offset, scroll: pending, webtoon: true }));
+        assert_eq!(
+            app.positions.get(&BookKey::new(&path)),
+            Some(Position { page: at.page, offset: at.offset, scroll: pending, webtoon: true, theater: false })
+        );
 
         let (mut app, _views) = webtoon_reader(false);
-        app.positions.set(&BookKey::new(&path), Position { page: 2, offset: 0.5, scroll: 7.0, webtoon: true });
+        app.positions.set(&BookKey::new(&path), Position { page: 2, offset: 0.5, scroll: 7.0, webtoon: true, theater: false });
         let Ok(Opened::Book(book)) = yoyomi_formats::open(&path) else { panic!("the fixture opens as a comic") };
         deliver(&mut app, 0, path.to_str().expect("a UTF-8 path"), Ok(book));
         let (at, pending) = strip_place(&app);
@@ -2459,6 +2375,89 @@ pub(crate) mod tests {
             keys(&mut app, key);
             assert_eq!(strip_place(&app).1, 0.0, "{key} drops the scroll");
             run_views(&mut app, &views, |app| app.deadline().is_none());
+        }
+    }
+
+    #[test]
+    fn t_and_big_t_switch_between_pages_webtoon_and_theater_mode() {
+        let (mut app, views) = webtoon_reader(false);
+        let mode = |app: &App| (app.webtoon, app.theater, app.strip_request(0).fill);
+        let settle = |app: &mut App| run_views(app, &views, |app| !app.panes[0].loading && app.deadline().is_none());
+        keys(&mut app, "j");
+        settle(&mut app);
+        let (before, _) = strip_place(&app);
+        assert!(before.offset > 0.0, "{before:?}");
+
+        // Each key switches the width at the same place, and leaves its own mode.
+        for (key, want, name) in [("T", (true, true, true), "theater"), ("t", (true, false, false), "webtoon"), ("T", (true, true, true), "theater")]
+        {
+            keys(&mut app, key);
+            assert_eq!(mode(&app), want, "after {key}");
+            assert!(app.status_left().ends_with(&format!("  ·  {name}")), "{}", app.status_left());
+            assert_near(strip_place(&app).0, before, key);
+            settle(&mut app);
+            assert_near(strip_place(&app).0, before, key);
+        }
+        keys(&mut app, "T");
+        assert_eq!(mode(&app), (false, false, false));
+        assert_eq!(app.status_left(), " kitty");
+        assert_eq!(app.panes[0].page, before.page);
+
+        // From pages, T shows the strip at the page in view without a spread.
+        keys(&mut app, "jsT");
+        assert_eq!((mode(&app), app.spread), ((true, true, true), false));
+        assert_near(strip_place(&app).0, StripPosition { page: before.page + 1, offset: 0.0 }, "T from a spread");
+        keys(&mut app, "t");
+        settle(&mut app);
+        keys(&mut app, "t");
+        assert_eq!(mode(&app), (false, false, false));
+    }
+
+    #[test]
+    fn theater_mode_refuses_spreads_splits_and_zoom() {
+        let mut app = reader(5);
+        keys(&mut app, "T");
+        for (key, want) in [
+            ("s", "spread is unavailable in theater mode (T to leave)"),
+            ("v", "split is unavailable in theater mode (T to leave)"),
+            ("O", "split is unavailable in theater mode (T to leave)"),
+            ("+", "theater mode fills the viewport width"),
+            ("-", "theater mode fills the viewport width"),
+        ] {
+            keys(&mut app, key);
+            assert!(app.status_left().ends_with(want), "{key}: {}", app.status_left());
+        }
+        assert!(app.theater && !app.spread && !app.split && app.pick_for.is_none() && app.panes[0].zoom == 1.0);
+
+        let (mut app, _) = app_with(Arc::new(HalfBlock::new(CellSize::FALLBACK)), 80, 24);
+        app.split = true;
+        deliver(&mut app, 0, "/books/a.cbz", Ok(fake(10, "/books/a.cbz")));
+        deliver(&mut app, 1, "/books/b.cbz", Ok(fake(10, "/books/b.cbz")));
+        keys(&mut app, "T");
+        assert!(app.status_left().ends_with("theater mode needs a single pane (v to unsplit)"));
+        assert!(!app.webtoon && !app.theater);
+    }
+
+    #[test]
+    fn theater_mode_is_saved_and_restored() {
+        let (mut app, _views) = webtoon_reader(false);
+        keys(&mut app, "Tj");
+        let (at, pending) = strip_place(&app);
+        app.quit = Some(Quit::Save);
+        app.finish();
+        let path = fixture("webtoon.cbz");
+        let key = BookKey::new(&path);
+        assert_eq!(app.positions.get(&key), Some(Position { page: at.page, offset: at.offset, scroll: pending, webtoon: true, theater: true }));
+
+        for (webtoon, theater, restored) in [(true, true, true), (false, true, false), (true, false, false)] {
+            let (mut app, _views) = kitty_reader("webtoon.cbz", false);
+            app.positions.set(&key, Position { page: 2, offset: 0.5, scroll: 0.0, webtoon, theater });
+            let Ok(Opened::Book(book)) = yoyomi_formats::open(&path) else { panic!("the fixture opens as a comic") };
+            deliver(&mut app, 0, path.to_str().expect("a UTF-8 path"), Ok(book));
+            assert_eq!((app.webtoon, app.theater, app.strip_request(0).fill), (webtoon, restored, restored), "{webtoon} {theater}");
+            if webtoon {
+                assert_near(strip_place(&app).0, StripPosition { page: 2, offset: 0.5 }, "the restore");
+            }
         }
     }
 

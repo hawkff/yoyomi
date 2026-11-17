@@ -193,6 +193,7 @@ impl Reader {
                 // Page mode goes on from the page at the top of the strip.
                 self.state.page = self.at().page;
                 self.state.webtoon = !webtoon;
+                self.state.theater = false;
                 self.state.spread = false;
                 self.state.offset = 0.0;
                 self.reset_view();
@@ -298,7 +299,7 @@ impl Reader {
         let Some(grid) = self.size else { return };
         let state = &self.state;
         if state.webtoon {
-            let request = StripRequest { grid, quarter_turns: state.quarter_turns, invert: state.invert };
+            let request = StripRequest { grid, quarter_turns: state.quarter_turns, invert: state.invert, fill: state.theater };
             let update = self.strip.show(self.at(), request);
             self.strip_shown = true;
             self.apply(update, true);
@@ -318,7 +319,6 @@ impl Reader {
                 transform,
                 selected_page: state.page,
                 text_top: 0,
-                fill: None,
             };
             let update = self.pager.show(request);
             self.apply(update, false);

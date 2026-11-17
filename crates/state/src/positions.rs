@@ -22,6 +22,9 @@ pub struct Position {
     pub scroll: f64,
     #[serde(default)]
     pub webtoon: bool,
+    /// In webtoon mode, every page fills the width of the viewport.
+    #[serde(default)]
+    pub theater: bool,
 }
 
 /// The contents of `progress.json`.
@@ -117,9 +120,9 @@ mod tests {
         let path = dir.path().join("yoyomi/progress.json");
         let book = BookKey::new(&dir.path().join("comic.cbz"));
         let mut store = Positions::load_from(Some(path.clone()));
-        store.set(&book, Position { page: 4, offset: 2.0, scroll: 7.0, webtoon: true });
+        store.set(&book, Position { page: 4, offset: 2.0, scroll: 7.0, webtoon: true, theater: false });
 
-        let want = Position { page: 4, offset: 1.0, scroll: 7.0, webtoon: true };
+        let want = Position { page: 4, offset: 1.0, scroll: 7.0, webtoon: true, theater: false };
         assert_eq!(store.get(&book), Some(want));
         store.save().unwrap();
 
@@ -158,6 +161,23 @@ mod tests {
         assert_eq!(b.get(book_a), None, "stale writer resurrected deletion");
         assert_eq!(b.get(book_b).map(|position| position.page), Some(3));
         assert_eq!(Positions::load_from(Some(path)).get(book_b).map(|position| position.page), Some(3));
+    }
+
+    #[test]
+    fn theater_mode_saves_and_older_files_load_without_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("progress.json");
+        let (old, new) = (BookKey::new(Path::new("old.cbz")), BookKey::new(Path::new("new.cbz")));
+        let key = serde_json::to_string(&old.text()).unwrap();
+        let older = format!(r#"{{"positions":{{{key}:{{"page":2,"offset":0.5,"scroll":0.0,"webtoon":true}}}}}}"#);
+        fs::write(&path, older).unwrap();
+        let mut store = Positions::load_from(Some(path.clone()));
+        assert_eq!(store.get(&old), Some(Position { page: 2, offset: 0.5, scroll: 0.0, webtoon: true, theater: false }));
+
+        let theater = Position { page: 3, offset: 0.25, scroll: 1.0, webtoon: true, theater: true };
+        store.set(&new, theater);
+        store.save().unwrap();
+        assert_eq!(Positions::load_from(Some(path)).get(&new), Some(theater));
     }
 
     #[test]
@@ -213,8 +233,8 @@ mod tests {
     fn set_replaces_numbers_json_cannot_hold() {
         let mut store = Positions::load_from(None);
         let book = &BookKey::new(Path::new("a.cbz"));
-        store.set(book, Position { page: 0, offset: f64::NAN, scroll: f64::INFINITY, webtoon: true });
-        assert_eq!(store.get(book), Some(Position { page: 0, offset: 0.0, scroll: 0.0, webtoon: true }));
+        store.set(book, Position { page: 0, offset: f64::NAN, scroll: f64::INFINITY, webtoon: true, theater: false });
+        assert_eq!(store.get(book), Some(Position { page: 0, offset: 0.0, scroll: 0.0, webtoon: true, theater: false }));
         store.save().unwrap();
     }
 }

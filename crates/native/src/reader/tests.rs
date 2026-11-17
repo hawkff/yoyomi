@@ -214,6 +214,29 @@ fn webtoon_toggles_keep_the_page_and_reset_the_view() {
 }
 
 #[test]
+fn t_leaves_theater_mode_for_pages_and_then_shows_plain_webtoon() {
+    let state = State { webtoon: true, theater: true, ..State::default() };
+    let mut rig = rig(book(pages(3, 50, 100), None), state, (100, 80));
+    rig.keys(&["t"]);
+    let state = rig.reader.state();
+    assert!(!state.webtoon && !state.theater, "{state:?}");
+    rig.keys(&["t"]);
+    let state = rig.reader.state();
+    assert!(state.webtoon && !state.theater, "{state:?}");
+}
+
+#[test]
+fn theater_mode_scales_pages_to_the_width_of_the_view() {
+    for theater in [false, true] {
+        let state = State { webtoon: true, theater, ..State::default() };
+        let mut rig = rig(book(pages(2, 50, 100), None), state, (100, 80));
+        let frame = rig.frame();
+        let alpha = |x: u32| pixel(&frame, x, 10).map(|pixel| pixel[3]);
+        assert_eq!((alpha(0), alpha(50)), (Some(if theater { 255 } else { 0 }), Some(255)), "theater {theater}");
+    }
+}
+
+#[test]
 fn a_trackpad_gesture_turns_one_page_and_a_wheel_notch_one_each() {
     let mut rig = rig(book(pages(10, 4, 4), None), State::default(), (40, 40));
     let start = Instant::now();
