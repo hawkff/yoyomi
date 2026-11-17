@@ -27,8 +27,11 @@ pub fn scale(image: &RgbaImage, width: u32, height: u32) -> RgbaImage {
 /// The pixels `x..x + w` across and `y..y + h` down of `image` turned
 /// clockwise by `quarter_turns` and scaled to `width` x `height`, equal to
 /// within one level per channel to those pixels of
-/// `scale(&rotate(image, quarter_turns), width, height)`. It turns and scales
-/// only the source the part needs. The part lies inside `width` x `height`.
+/// `scale(&rotate(image, quarter_turns), width, height)`. For a translucent
+/// pixel that holds for its color times its alpha, which is what shows: the
+/// resizer weighs colors by alpha with a precision it picks by the size it
+/// is asked for. It turns and scales only the source the part needs. The
+/// part lies inside `width` x `height`.
 pub fn scale_part(image: &RgbaImage, quarter_turns: u8, (width, height): (u32, u32), (x, y, w, h): (u32, u32, u32, u32)) -> RgbaImage {
     let mut out = RgbaImage::new(w.max(1), h.max(1));
     if image.width() == 0 || image.height() == 0 {
@@ -176,6 +179,22 @@ mod tests {
         assert!((100..156).contains(&a), "alpha {a}");
         assert_eq!(scale(&image, 7, 3).dimensions(), (7, 3));
         assert_eq!(scale(&RgbaImage::new(0, 0), 0, 4).dimensions(), (1, 4));
+    }
+
+    #[test]
+    fn scale_part_matches_translucent_pixels_in_the_color_that_shows() {
+        // Two translucent pixels enlarged a hundred times, compared one
+        // output pixel at a time: the smallest part against the widest whole.
+        let image = RgbaImage::from_raw(2, 1, vec![0, 0, 0, 100, 255, 0, 0, 100]).unwrap();
+        let whole = scale(&image, 200, 1);
+        let shown = |pixel: [u8; 4], channel: usize| f64::from(pixel[channel]) * f64::from(pixel[3]) / 255.0;
+        for x in 0..200 {
+            let (got, want) = (scale_part(&image, 0, (200, 1), (x, 0, 1, 1)).get_pixel(0, 0).0, whole.get_pixel(x, 0).0);
+            assert!(got[3].abs_diff(want[3]) <= 1, "pixel {x}: {got:?} against {want:?}");
+            for channel in 0..3 {
+                assert!((shown(got, channel) - shown(want, channel)).abs() <= 1.5, "pixel {x}: {got:?} against {want:?}");
+            }
+        }
     }
 
     #[test]

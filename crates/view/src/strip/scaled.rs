@@ -49,6 +49,9 @@ impl Section {
 pub(super) struct ScaledRows {
     pub pixels: Pixels,
     pub top: u32,
+    /// `pixels` is the whole page as decoded, which every section of the page
+    /// then holds.
+    pub whole: bool,
 }
 
 /// Scaled sections of pages shared by the strip's jobs. Each section scales
@@ -64,8 +67,12 @@ pub(super) struct ScaledPages {
 struct State {
     /// A slot per section; jobs lock a slot while they fill it.
     slots: HashMap<Section, Arc<Mutex<Option<Result<ScaledRows>>>>>,
-    /// Filled sections, least recently used first.
-    order: VecDeque<Section>,
+    /// Filled sections, least recently used first, each with whether it
+    /// holds its page whole.
+    order: VecDeque<(Section, bool)>,
+    /// How many kept sections hold each page whole. They share one
+    /// allocation, which counts once and in full.
+    whole: HashMap<Key, usize>,
     pixels: u64,
     /// How many sections were scaled, for tests.
     scales: usize,
@@ -93,11 +100,11 @@ impl ScaledPages {
         // stays out.
         let kept = state.slots.get(&section).is_some_and(|kept| Arc::ptr_eq(kept, &slot));
         match &result {
-            Ok(_) => {
+            Ok(rows) => {
                 state.scales += 1;
                 *filled = Some(result.clone());
                 if kept {
-                    state.insert(section);
+                    state.insert(section, rows.whole);
                 }
             }
             // A cancelled job leaves the slot empty for the next one.
@@ -118,6 +125,7 @@ impl ScaledPages {
         let mut state = self.state.lock();
         state.slots.clear();
         state.order.clear();
+        state.whole.clear();
         state.pixels = 0;
     }
 
@@ -139,20 +147,40 @@ impl ScaledPages {
 
 impl State {
     fn touch(&mut self, section: Section) {
-        if let Some(i) = self.order.iter().position(|&kept| kept == section) {
-            self.order.remove(i);
-            self.order.push_back(section);
+        if let Some(i) = self.order.iter().position(|&(kept, _)| kept == section)
+            && let Some(entry) = self.order.remove(i)
+        {
+            self.order.push_back(entry);
         }
     }
 
-    fn insert(&mut self, section: Section) {
-        self.pixels += section.pixels();
-        self.order.push_back(section);
+    fn insert(&mut self, section: Section, whole: bool) {
+        let page = u64::from(section.key.width) * u64::from(section.key.height);
+        // A page held whole keeps all of its pixels alive with its first
+        // section, and nothing more with the others.
+        self.pixels += match whole.then(|| self.whole.entry(section.key).or_insert(0)) {
+            Some(held) => {
+                *held += 1;
+                if *held == 1 { page } else { 0 }
+            }
+            None => section.pixels(),
+        };
+        self.order.push_back((section, whole));
         // The newest section always stays.
         while self.pixels > ScaledPages::MAX_PIXELS && self.order.len() > 1 {
-            let Some(oldest) = self.order.pop_front() else { break };
+            let Some((oldest, whole)) = self.order.pop_front() else { break };
             self.slots.remove(&oldest);
-            self.pixels -= oldest.pixels();
+            self.pixels -= match whole.then(|| self.whole.get_mut(&oldest.key)).flatten() {
+                Some(held) if *held > 1 => {
+                    *held -= 1;
+                    0
+                }
+                Some(_) => {
+                    self.whole.remove(&oldest.key);
+                    u64::from(oldest.key.width) * u64::from(oldest.key.height)
+                }
+                None => oldest.pixels(),
+            };
         }
     }
 }
@@ -164,13 +192,13 @@ fn scale_section(book: &PageCache, section: Section, cancel: &Cancel) -> Result<
     check_size(key.width, rows.end - rows.start)?;
     let page = book.page(key.page, cancel)?;
     if key.quarter_turns & 3 == 0 && !key.invert && page.dimensions() == (key.width, key.height) {
-        return Ok(ScaledRows { pixels: page, top: 0 });
+        return Ok(ScaledRows { pixels: page, top: 0, whole: true });
     }
     let mut pixels = scale_part(&page, key.quarter_turns, (key.width, key.height), (0, rows.start, key.width, rows.end - rows.start));
     if key.invert {
         invert(&mut pixels);
     }
-    Ok(ScaledRows { pixels: Arc::new(pixels), top: rows.start })
+    Ok(ScaledRows { pixels: Arc::new(pixels), top: rows.start, whole: false })
 }
 
 /// One page in a strip image: its scaled pixels go with their top-left

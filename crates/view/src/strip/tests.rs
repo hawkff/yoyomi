@@ -648,6 +648,23 @@ fn a_frame_across_a_section_join_and_a_page_join_shows_every_row_once() {
 }
 
 #[test]
+fn a_page_kept_whole_counts_once_however_many_sections_show_it() {
+    // Two pages that need no scaling, each three sections tall.
+    let rows = 3 * SECTION_ROWS;
+    let sixel = Recorder::new(RendererKind::Sixel, PIXEL);
+    let mut h = harness(Pages::new(vec![rows_page(0, 100, rows), rows_page(1, 100, rows)]), sixel, false);
+    h.show(0, 0.0, request(100, 100));
+    let scaled = h.strip.cx.scaled.clone();
+    let page = u64::from(100 * rows);
+    assert_eq!((scaled.kept(), scaled.pixels()), (1, page), "the first section holds the whole page");
+    // A section further down the page each time, then the next page.
+    for (kept, pixels) in [(2, page), (3, page), (4, 2 * page)] {
+        h.scroll(f64::from(SECTION_ROWS));
+        assert_eq!((scaled.kept(), scaled.pixels()), (kept, pixels));
+    }
+}
+
+#[test]
 fn scrolling_a_long_strip_keeps_its_sections_within_the_budget() {
     // Filled to 1,000 wide, every page grows to 20 whole sections, and the
     // strip to more pixels than the budget.
